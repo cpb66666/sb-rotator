@@ -1,72 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# install.sh - 233boy/sing-box 面板动态合租同步 & Clash API 多IP共享限速 一键安装脚本 (v3.0.0)
-# 使用方式:
-#   bash <(curl -fsSL https://raw.githubusercontent.com/cpb66666/zidonghuanmi/main/install.sh)
-# ==============================================================================
-
-set -e
-export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-NC='\033[0m'
-
-GITHUB_RAW_BASE_URL=""
-
-INSTALL_BIN="/usr/local/bin/sb-rotator"
-ALIAS_BIN="/usr/local/bin/sbr"
-INSTALL_DIR="/etc/sb-rotator"
-
-prompt_read() {
-    local prompt_str="$1" var_name="$2"
-    if [[ -t 0 ]]; then read -rp "${prompt_str}" "${var_name}" || return 1
-    elif [[ -e /dev/tty ]]; then read -rp "${prompt_str}" "${var_name}" < /dev/tty || return 1
-    else read -rp "${prompt_str}" "${var_name}" || return 1; fi
-}
-
-check_root() {
-    if [[ "$(id -u)" != "0" ]]; then
-        echo -e "${RED}[错误] 请使用 root 用户运行此脚本 (sudo -i)${NC}"
-        exit 1
-    fi
-}
-
-check_dependencies() {
-    local missing=()
-    for cmd in curl sed awk grep timeout jq python3 tc ip; do
-        command -v "${cmd}" >/dev/null 2>&1 || missing+=("${cmd}")
-    done
-    if (( ${#missing[@]} > 0 )); then
-        echo -e "${YELLOW}[提示] 正在安装必要系统组件 (${missing[*]}) ...${NC}"
-        if command -v apt-get >/dev/null 2>&1; then
-            apt-get update -y >/dev/null 2>&1
-            apt-get install -y curl sed gawk grep util-linux coreutils openssl ca-certificates jq python3 iproute2 iptables tzdata >/dev/null 2>&1
-        elif command -v yum >/dev/null 2>&1; then
-            yum install -y curl sed gawk grep util-linux coreutils openssl ca-certificates jq python3 iproute iptables tzdata >/dev/null 2>&1
-        elif command -v apk >/dev/null 2>&1; then
-            apk add --no-cache bash curl sed gawk grep util-linux coreutils openssl ca-certificates jq python3 iproute2 iptables tzdata >/dev/null 2>&1
-        fi
-    fi
-}
-
-deploy_core_script() {
-    mkdir -p "${INSTALL_DIR}"
-    if [[ -n "${GITHUB_RAW_BASE_URL}" ]]; then
-        if curl -fsSL --connect-timeout 10 "${GITHUB_RAW_BASE_URL%/}/sb-rotator.sh" -o "${INSTALL_BIN}"; then
-            chmod +x "${INSTALL_BIN}"
-            ln -sf "${INSTALL_BIN}" "${ALIAS_BIN}"
-            return 0
-        fi
-    fi
-
-    cat > "${INSTALL_BIN}" <<'__EOF_SB_ROTATOR_CORE__'
-#!/usr/bin/env bash
-# ==============================================================================
-# sb-rotator.sh - 233boy/sing-box 面板动态合租同步 & Clash API 多IP共享限速系统 (v3.0.0)
+# sb-rotator.sh - 233boy/sing-box 面板动态合租同步 & Clash API 多IP共享限速系统 (v3.0.1)
 # 核心能力:
 #   1. 自动扫描 /etc/sing-box/conf/*.json，提取管理员默认链接并通过 POST /api/v1/server/register 上报注册
 #   2. 同步响应 & Push 回调监听 (POST /api/v1/sync): 按协议 cred_type (uuid/password) 动态注入/移除合租用户，保留管理员默认账号
@@ -77,7 +11,7 @@ deploy_core_script() {
 set -o pipefail
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-VERSION="3.0.0"
+VERSION="3.0.1"
 INSTALL_DIR="${INSTALL_DIR:-/etc/sb-rotator}"
 CONFIG_FILE="${CONFIG_FILE:-${INSTALL_DIR}/config.env}"
 ADMIN_ACCOUNTS_FILE="${ADMIN_ACCOUNTS_FILE:-${INSTALL_DIR}/admin_accounts.json}"
@@ -133,7 +67,7 @@ ensure_dirs() {
     [[ ! -f "${ACTIVE_USERS_FILE}" ]] && echo "[]" > "${ACTIVE_USERS_FILE}" 2>/dev/null || true
     [[ ! -f "${RUNTIME_STATUS_FILE}" ]] && echo "{}" > "${RUNTIME_STATUS_FILE}" 2>/dev/null || true
     chmod 600 "${CONFIG_FILE}" "${ADMIN_ACCOUNTS_FILE}" 2>/dev/null || true
-    # 移除旧版换密定时任务（v3.0.0 不再使用定时换密）
+    # 移除旧版换密定时任务（v3.0.1 不再使用定时换密）
     if [[ -f "${OLD_CRON_FILE}" ]]; then
         rm -f "${OLD_CRON_FILE}" 2>/dev/null || true
         systemctl reload cron 2>/dev/null || systemctl reload crond 2>/dev/null || true
@@ -207,7 +141,7 @@ load_config() {
 save_config() {
     ensure_dirs
     cat > "${CONFIG_FILE}" <<EOF
-# sb-rotator v3.0.0 配置文件 (面板同步 + Clash API 动态限速)
+# sb-rotator v3.0.1 配置文件 (面板同步 + Clash API 动态限速)
 PANEL_URL="${PANEL_URL}"
 API_KEY="${API_KEY}"
 SERVER_ID="${SERVER_ID:-1}"
@@ -272,7 +206,7 @@ write_python_daemon() {
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-sb_agent_daemon.py - 233boy/sing-box 节点注册、Push 同步回调与 Clash API 多IP共享限速守护进程 (v3.0.0)
+sb_agent_daemon.py - 233boy/sing-box 节点注册、Push 同步回调与 Clash API 多IP共享限速守护进程 (v3.0.1)
 """
 
 import os
@@ -289,6 +223,7 @@ import threading
 import subprocess
 import urllib.request
 import urllib.error
+import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 INSTALL_DIR = os.environ.get("INSTALL_DIR", "/etc/sb-rotator")
@@ -1242,11 +1177,40 @@ class PushWebhookHandler(BaseHTTPRequestHandler):
             self._send_json(403, {"ok": False, "message": "server_id mismatch"})
             return
 
-        # 校验 Bearer Token 或 HMAC-SHA256 签名 (X-Dujiao-Signature / X-Signature)
-        auth_hdr = (self.headers.get("Authorization") or "").strip()
-        api_key_hdr = (self.headers.get("X-API-Key") or "").strip()
-        ts_hdr = (self.headers.get("X-Dujiao-Timestamp") or self.headers.get("X-Timestamp") or "").strip()
-        sig_hdr = (self.headers.get("X-Dujiao-Signature") or self.headers.get("X-Signature") or "").strip()
+        # 灵活兼容多种鉴权方式 (Bearer Token / Header Secret / HMAC-SHA256 / URL Query Token)
+        auth_hdr = (self.headers.get("Authorization") or self.headers.get("authorization") or "").strip()
+        token_extracted = re.sub(r"^(?:Bearer|Token)\s+", "", auth_hdr, flags=re.I).strip()
+        api_key_hdr = (
+            self.headers.get("X-API-Key")
+            or self.headers.get("X-Server-Secret")
+            or self.headers.get("X-Agent-Secret")
+            or self.headers.get("X-Token")
+            or self.headers.get("Token")
+            or self.headers.get("Secret")
+            or ""
+        ).strip()
+
+        # 检查 URL Query 参数中的 token/secret/key
+        query_params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        query_token = (
+            query_params.get("token", [""])[0]
+            or query_params.get("secret", [""])[0]
+            or query_params.get("key", [""])[0]
+            or query_params.get("api_key", [""])[0]
+        ).strip()
+
+        ts_hdr = (
+            self.headers.get("X-Dujiao-Timestamp")
+            or self.headers.get("X-Timestamp")
+            or self.headers.get("Timestamp")
+            or ""
+        ).strip()
+        sig_hdr = (
+            self.headers.get("X-Dujiao-Signature")
+            or self.headers.get("X-Signature")
+            or self.headers.get("Signature")
+            or ""
+        ).strip()
         if sig_hdr.startswith("sha256="):
             sig_hdr = sig_hdr[7:]
 
@@ -1254,21 +1218,43 @@ class PushWebhookHandler(BaseHTTPRequestHandler):
         if not secret:
             authed = True
         else:
-            if auth_hdr == f"Bearer {secret}" or api_key_hdr == secret:
+            clean_secret = secret.strip()
+            # 1. 直接匹配 Token 或 Header Secret 或 Query Token
+            if (
+                token_extracted == clean_secret
+                or auth_hdr == clean_secret
+                or api_key_hdr == clean_secret
+                or query_token == clean_secret
+            ):
                 authed = True
+            # 2. 匹配 HMAC-SHA256 签名 (覆盖所有常见拼接形式)
             elif sig_hdr:
                 candidates = [
-                    compute_hmac_sha256(secret, f"{ts_hdr}.{raw_body}"),
-                    compute_hmac_sha256(secret, f"{ts_hdr}\n{raw_body}"),
-                    compute_hmac_sha256(secret, f"{ts_hdr}{raw_body}"),
-                    compute_hmac_sha256(secret, raw_body),
+                    compute_hmac_sha256(clean_secret, f"{ts_hdr}.{raw_body}"),
+                    compute_hmac_sha256(clean_secret, f"{ts_hdr}{raw_body}"),
+                    compute_hmac_sha256(clean_secret, f"{ts_hdr}\n{raw_body}"),
+                    compute_hmac_sha256(clean_secret, f"{ts_hdr}:{raw_body}"),
+                    compute_hmac_sha256(clean_secret, f"{raw_body}.{ts_hdr}"),
+                    compute_hmac_sha256(clean_secret, raw_body),
                 ]
                 if any(hmac.compare_digest(sig_hdr.lower(), c.lower()) for c in candidates):
                     authed = True
 
         if not authed:
-            log("WARN", f"[Push拒绝] 来自 {self.client_address[0]} 的推送签名/密钥校验失败")
-            self._send_json(401, {"ok": False, "message": "unauthorized"})
+            headers_dict = {k: v for k, v in self.headers.items()}
+            masked_sec = f"{secret[:3]}***{secret[-3:]}" if len(secret) > 6 else "***"
+            log("WARN", f"[Push拒绝 401] 来源: {self.client_address[0]} | 接收 Headers: {json.dumps(headers_dict, ensure_ascii=False)} | 本地配置 API_KEY: {masked_sec}")
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            with open(os.path.join(CACHE_DIR, "last_rejected_push.json"), "w", encoding="utf-8") as f:
+                json.dump({
+                    "time": now_cst_str(),
+                    "client_ip": self.client_address[0],
+                    "path": self.path,
+                    "headers": headers_dict,
+                    "body": raw_body,
+                    "local_configured_secret_preview": masked_sec,
+                }, f, ensure_ascii=False, indent=2)
+            self._send_json(401, {"ok": False, "message": "unauthorized (secret or signature mismatch)", "client_ip": self.client_address[0]})
             return
 
         try:
@@ -1292,7 +1278,7 @@ class PushWebhookHandler(BaseHTTPRequestHandler):
 def run_daemon():
     cfg = load_env_config()
     port = int(cfg.get("AGENT_PORT") or 18080)
-    log("INFO", f"启动 sb-agent 守护进程 (v3.0.0) | Push 监听端口: {port} | 限速阈值: >{cfg.get('IP_THRESHOLD', '2')} IPs -> 共享 {cfg.get('LIMIT_MBPS', '10')}Mbps")
+    log("INFO", f"启动 sb-agent 守护进程 (v3.0.1) | Push 监听端口: {port} | 限速阈值: >{cfg.get('IP_THRESHOLD', '2')} IPs -> 共享 {cfg.get('LIMIT_MBPS', '10')}Mbps")
 
     # 启动时自动向面板执行一次协议上报与全量用户初始化
     if cfg.get("PANEL_URL") and cfg.get("API_KEY"):
@@ -1344,6 +1330,29 @@ if __name__ == "__main__":
         sys.exit(0 if ok else 1)
     elif cmd == "poll-once":
         RATE_LIMITER.poll_once()
+        elif cmd == "test-push":
+        cfg = load_env_config()
+        port = int(cfg.get("AGENT_PORT") or 18080)
+        secret = cfg.get("API_KEY", "")
+        test_payload = json.dumps({"server_id": int(cfg.get("SERVER_ID", 1)), "users": []}).encode()
+        ts = str(int(time.time()))
+        sig = compute_hmac_sha256(secret, f"{ts}.{test_payload.decode()}")
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {secret}",
+            "X-Server-Id": str(cfg.get("SERVER_ID", 1)),
+            "X-Dujiao-Timestamp": ts,
+            "X-Dujiao-Signature": sig,
+        }
+        url = f"http://127.0.0.1:{port}/api/v1/sync"
+        try:
+            req = urllib.request.Request(url, data=test_payload, headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                print(f"[测试通过] 本地 Push 响应 HTTP {resp.getcode()}: {resp.read().decode()}")
+        except urllib.error.HTTPError as he:
+            print(f"[测试失败] HTTP {he.code}: {he.read().decode()}")
+        except Exception as e:
+            print(f"[测试失败] 无法连接到本地 Push 服务: {e}")
     elif cmd == "clear-tc":
         cfg = load_env_config()
         ClashRateLimiter.clear_all_tc(cfg.get("NET_IFACE") or detect_default_iface())
@@ -1378,7 +1387,7 @@ setup_systemd_service() {
     if [[ -d /run/systemd/system ]]; then
         cat > "${SERVICE_FILE}" <<EOF
 [Unit]
-Description=sb-agent v3.0.0 (sing-box Panel Sync & Clash API Rate Limiter)
+Description=sb-agent v3.0.1 (sing-box Panel Sync & Clash API Rate Limiter)
 After=network.target sing-box.service
 
 [Service]
@@ -1598,7 +1607,7 @@ view_logs_menu() {
 }
 
 uninstall_all() {
-    echo -e "\n${RED}${BOLD}⚠️  确认卸载 sb-rotator (v3.0.0) 及其 Push 守护与限速规则吗？（不影响 sing-box 本身）${NC}"
+    echo -e "\n${RED}${BOLD}⚠️  确认卸载 sb-rotator (v3.0.1) 及其 Push 守护与限速规则吗？（不影响 sing-box 本身）${NC}"
     local confirm=""
     prompt_read "输入 y 确认卸载，其他键取消: " confirm || return 0
     [[ ! "${confirm}" =~ ^[Yy]$ ]] && { info "已取消卸载"; return 0; }
@@ -1692,6 +1701,7 @@ case "${1:-}" in
     --dry-run)               python3 "${DAEMON_SCRIPT}" dry-run ;;
     --sync-file)             python3 "${DAEMON_SCRIPT}" sync-file "${2:-}" ;;
     --poll-once)             python3 "${DAEMON_SCRIPT}" poll-once ;;
+    --test-push)             python3 "${DAEMON_SCRIPT}" test-push ;;
     --clear-limits)          python3 "${DAEMON_SCRIPT}" clear-tc ;;
     --config)                interactive_configure ;;
     --logs)                  tail -n 50 "${LOG_FILE}" 2>/dev/null || echo "暂无日志" ;;
@@ -1701,62 +1711,3 @@ case "${1:-}" in
     "")                      main_menu ;;
     *)                       err "未知参数: $1"; usage; exit 1 ;;
 esac
-
-__EOF_SB_ROTATOR_CORE__
-
-    chmod +x "${INSTALL_BIN}"
-    ln -sf "${INSTALL_BIN}" "${ALIAS_BIN}"
-}
-
-main() {
-    check_root
-    echo -e "\n${BOLD}${CYAN}=================================================================${NC}"
-    echo -e "${BOLD}   233boy/sing-box 面板动态同步 & Clash API 多IP限速一键脚本 v3.0.0${NC}"
-    echo -e "${BOLD}${CYAN}=================================================================${NC}"
-
-    if [[ -x "${INSTALL_BIN}" && -f "${INSTALL_DIR}/config.env" && "${1:-}" == "" ]]; then
-        echo -e "${GREEN}检测到本机已安装旧版或现有版本，请选择操作：${NC}"
-        echo -e "  ${GREEN}1)${NC} 升级/重装至 v3.0.0 并引导配置面板对接与多 IP 限速"
-        echo -e "  ${GREEN}2)${NC} 升级核心脚本至 v3.0.0 并立即上报协议同步用户 (--register)"
-        echo -e "  ${GREEN}3)${NC} 打开管理面板"
-        echo -e "  ${RED}4)${NC} 一键卸载"
-        echo -e "  ${GREEN}0)${NC} 退出"
-        local exist_opt=""
-        prompt_read "请选择 [0-4，默认 1]: " exist_opt || exit 0
-        case "${exist_opt:-1}" in
-            1) ;;
-            2)
-                check_dependencies
-                deploy_core_script
-                "${INSTALL_BIN}" --register || true
-                exec "${INSTALL_BIN}"
-                ;;
-            3)
-                check_dependencies
-                deploy_core_script
-                exec "${INSTALL_BIN}"
-                ;;
-            4) deploy_core_script; exec "${INSTALL_BIN}" --uninstall ;;
-            0) exit 0 ;;
-        esac
-    fi
-
-    check_dependencies
-    deploy_core_script
-    echo -e "${GREEN}[成功] 核心程序 v3.0.0 已安装至 ${INSTALL_BIN} (快捷命令: sbr)${NC}"
-
-    "${INSTALL_BIN}" --config
-
-    echo ""
-    local do_reg=""
-    prompt_read "是否立即向面板上报本机所有协议默认链接并同步合租用户？(y/n，默认 y): " do_reg || true
-    if [[ "${do_reg:-y}" =~ ^[Yy]$ ]]; then
-        "${INSTALL_BIN}" --register || true
-    fi
-
-    echo -e "\n${BOLD}${GREEN}=================================================================${NC}"
-    echo -e "${BOLD}${GREEN} 🎉 v3.0.0 部署完成！随时输入 ${YELLOW}sbr${GREEN} 即可查看协议、用户与实时限速状态${NC}"
-    echo -e "${BOLD}${GREEN}=================================================================${NC}"
-}
-
-main "$@"
