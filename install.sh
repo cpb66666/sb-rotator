@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# install.sh - 233boy/sing-box 面板动态合租同步 & Clash API 多IP共享限速 一键安装脚本 (v3.0.0)
+# install.sh - 233boy/sing-box 面板动态合租同步 & Clash API 多IP共享限速 一键安装脚本 (v3.0.1)
 # 使用方式:
 #   bash <(curl -fsSL https://raw.githubusercontent.com/cpb66666/zidonghuanmi/main/install.sh)
 # ==============================================================================
@@ -66,7 +66,7 @@ deploy_core_script() {
     cat > "${INSTALL_BIN}" <<'__EOF_SB_ROTATOR_CORE__'
 #!/usr/bin/env bash
 # ==============================================================================
-# sb-rotator.sh - 233boy/sing-box 面板动态合租同步 & Clash API 多IP共享限速系统 (v3.0.0)
+# sb-rotator.sh - 233boy/sing-box 面板动态合租同步 & Clash API 多IP共享限速系统 (v3.0.1)
 # 核心能力:
 #   1. 自动扫描 /etc/sing-box/conf/*.json，提取管理员默认链接并通过 POST /api/v1/server/register 上报注册
 #   2. 同步响应 & Push 回调监听 (POST /api/v1/sync): 按协议 cred_type (uuid/password) 动态注入/移除合租用户，保留管理员默认账号
@@ -77,7 +77,7 @@ deploy_core_script() {
 set -o pipefail
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-VERSION="3.0.0"
+VERSION="3.0.1"
 INSTALL_DIR="${INSTALL_DIR:-/etc/sb-rotator}"
 CONFIG_FILE="${CONFIG_FILE:-${INSTALL_DIR}/config.env}"
 ADMIN_ACCOUNTS_FILE="${ADMIN_ACCOUNTS_FILE:-${INSTALL_DIR}/admin_accounts.json}"
@@ -133,7 +133,7 @@ ensure_dirs() {
     [[ ! -f "${ACTIVE_USERS_FILE}" ]] && echo "[]" > "${ACTIVE_USERS_FILE}" 2>/dev/null || true
     [[ ! -f "${RUNTIME_STATUS_FILE}" ]] && echo "{}" > "${RUNTIME_STATUS_FILE}" 2>/dev/null || true
     chmod 600 "${CONFIG_FILE}" "${ADMIN_ACCOUNTS_FILE}" 2>/dev/null || true
-    # 移除旧版换密定时任务（v3.0.0 不再使用定时换密）
+    # 移除旧版换密定时任务（v3.0.1 不再使用定时换密）
     if [[ -f "${OLD_CRON_FILE}" ]]; then
         rm -f "${OLD_CRON_FILE}" 2>/dev/null || true
         systemctl reload cron 2>/dev/null || systemctl reload crond 2>/dev/null || true
@@ -207,7 +207,7 @@ load_config() {
 save_config() {
     ensure_dirs
     cat > "${CONFIG_FILE}" <<EOF
-# sb-rotator v3.0.0 配置文件 (面板同步 + Clash API 动态限速)
+# sb-rotator v3.0.1 配置文件 (面板同步 + Clash API 动态限速)
 PANEL_URL="${PANEL_URL}"
 API_KEY="${API_KEY}"
 SERVER_ID="${SERVER_ID:-1}"
@@ -272,7 +272,7 @@ write_python_daemon() {
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-sb_agent_daemon.py - 233boy/sing-box 节点注册、Push 同步回调与 Clash API 多IP共享限速守护进程 (v3.0.0)
+sb_agent_daemon.py - 233boy/sing-box 节点注册、Push 同步回调与 Clash API 多IP共享限速守护进程 (v3.0.1)
 """
 
 import os
@@ -289,6 +289,7 @@ import threading
 import subprocess
 import urllib.request
 import urllib.error
+import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 INSTALL_DIR = os.environ.get("INSTALL_DIR", "/etc/sb-rotator")
@@ -340,6 +341,11 @@ def load_env_config():
         "ACTIVE_WINDOW_SEC": "15",
         "LIMIT_ADMIN": "false",
         "NET_IFACE": "",
+        "DYN_LIMIT_ENABLE": "true",   # 动态限速开关
+        "DYN_WINDOW_MIN": "40",       # 流量统计窗口(分钟)
+        "DYN_THRESHOLD_GB": "2.5",    # 窗口内用户总流量阈值(GB)
+        "DYN_LIMIT_MBPS": "10",       # 动态限速带宽(Mbps)
+        "DYN_LIMIT_MIN": "60",        # 动态限速持续时间(分钟)
     }
     if os.path.isfile(CONFIG_FILE):
         try:
@@ -994,6 +1000,11 @@ class ClashRateLimiter:
         self.user_cid_map = {}        # {username: int (10..899)}
         self.next_cid = 10
         self.tc_initialized_iface = None
+        # --- 动态限速状态 (以用户为单位) ---
+        self.conn_last = {}           # {conn_id: 上次累计字节数}
+        self.conn_baselined = False   # 首轮仅建立基线，不计入历史流量
+        self.traffic_window = {}      # {username: [(ts, bytes), ...]}
+        self.dyn_until = {}           # {username: 动态限速结束时间戳}
 
     def _get_cid(self, username):
         if username not in self.user_cid_map:
@@ -1126,6 +1137,7 @@ class ClashRateLimiter:
 
         conns = data.get("connections") or []
         now = time.time()
+        seen_conn_ids = set()
 
         for c in conns:
             if not isinstance(c, dict):
@@ -1136,6 +1148,21 @@ class ClashRateLimiter:
             if user == "admin" and not limit_admin:
                 continue
             self.user_ip_last_seen.setdefault(user, {})[src_ip] = now
+            # 动态限速：按连接累计字节增量统计用户总流量(上行+下行，所有 IP 合并)
+            cid_key = str(c.get("id") or "")
+            if cid_key:
+                total = int(c.get("upload") or 0) + int(c.get("download") or 0)
+                seen_conn_ids.add(cid_key)
+                last = self.conn_last.get(cid_key)
+                self.conn_last[cid_key] = total
+                delta = (total - last) if last is not None else (total if self.conn_baselined else 0)
+                if delta > 0:
+                    self.traffic_window.setdefault(user, []).append((now, delta))
+
+        for k in list(self.conn_last.keys()):
+            if k not in seen_conn_ids:
+                del self.conn_last[k]
+        self.conn_baselined = True
 
         # 清理超过活跃时间窗口的旧 IP 记录
         active_user_ips = {}
@@ -1155,12 +1182,44 @@ class ClashRateLimiter:
             if isinstance(u, dict) and u.get("email") and int(u.get("speed_limit_bps") or 0) > 0:
                 user_custom_mbps[u["email"]] = max(1, int(u["speed_limit_bps"]) // 1_000_000)
 
-        # 评估哪些用户超出源 IP 数量阈值
+        # 动态限速：滑动窗口内用户总流量超阈值 -> 限速固定时长；到期后清空窗口重新统计
+        dyn_enabled = cfg.get("DYN_LIMIT_ENABLE", "true").lower() == "true"
+        try:
+            dyn_window = max(1, float(cfg.get("DYN_WINDOW_MIN", "40"))) * 60
+            dyn_bytes = max(0.01, float(cfg.get("DYN_THRESHOLD_GB", "2.5"))) * 1024 ** 3
+            dyn_mbps = max(1, int(float(cfg.get("DYN_LIMIT_MBPS", "10"))))
+            dyn_dur = max(1, float(cfg.get("DYN_LIMIT_MIN", "60"))) * 60
+        except ValueError:
+            dyn_window, dyn_bytes, dyn_mbps, dyn_dur = 2400, 2.5 * 1024 ** 3, 10, 3600
+        if not dyn_enabled:
+            self.dyn_until.clear()
+            self.traffic_window.clear()
+        for user in list(self.dyn_until.keys()):
+            if now >= self.dyn_until[user]:
+                del self.dyn_until[user]
+                log("INFO", f"[动态限速到期] 用户 [{user}] 1 小时动态限速到期，按最近 {int(dyn_window // 60)} 分钟流量(含限速期间)重新评估")
+        for user in list(self.traffic_window.keys()):
+            samples = [(t, b) for t, b in self.traffic_window[user] if now - t <= dyn_window]
+            if not samples:
+                del self.traffic_window[user]
+                continue
+            self.traffic_window[user] = samples
+            used = sum(b for _, b in samples)
+            if user not in self.dyn_until and used >= dyn_bytes:
+                self.dyn_until[user] = now + dyn_dur
+                log("WARN", f"[触发动态限速] 用户 [{user}] {int(dyn_window // 60)} 分钟内流量 {used / 1024 ** 3:.2f}GB >= {dyn_bytes / 1024 ** 3:.2f}GB -> 其所有 IP 共享 {dyn_mbps}Mbps 限速 {int(dyn_dur // 60)} 分钟")
+
+        # 评估哪些用户需限速：超出源 IP 数量阈值 和/或 处于动态限速期 (同一用户共用同一个 tc 限速类，取较小带宽，互不冲突)
         currently_exceeded = set()
-        for user, ips in active_user_ips.items():
-            if len(ips) > ip_threshold:
+        for user in set(active_user_ips.keys()) | set(self.dyn_until.keys()):
+            ips = active_user_ips.get(user, [])
+            ip_exceeded = len(ips) > ip_threshold
+            dyn_active = user in self.dyn_until
+            if ip_exceeded or dyn_active:
                 currently_exceeded.add(user)
-                limit_val = user_custom_mbps.get(user, default_limit_mbps)
+                limit_val = user_custom_mbps.get(user, default_limit_mbps) if ip_exceeded else None
+                if dyn_active:
+                    limit_val = dyn_mbps if limit_val is None else min(limit_val, dyn_mbps)
                 prev = self.throttled_users.get(user)
                 if not prev or prev.get("ips") != ips or prev.get("limit_mbps") != limit_val:
                     self.apply_user_limit(iface, user, ips, limit_val)
@@ -1170,9 +1229,15 @@ class ClashRateLimiter:
                         "ip_count": len(ips),
                         "limit_mbps": limit_val,
                         "since": prev["since"] if prev else int(now),
+                        "dynamic_until": int(self.dyn_until.get(user, 0)),
                     }
                     if not prev:
-                        log("WARN", f"[触发限速] 用户 [{user}] 活跃源 IP 数 ({len(ips)}) > 阈值 ({ip_threshold}) | IPs: {', '.join(ips)} -> 已加入共享 {limit_val}Mbps 限速集合")
+                        if ip_exceeded:
+                            log("WARN", f"[触发限速] 用户 [{user}] 活跃源 IP 数 ({len(ips)}) > 阈值 ({ip_threshold}) | IPs: {', '.join(ips)} -> 已加入共享 {limit_val}Mbps 限速集合")
+                        else:
+                            log("WARN", f"[动态限速生效] 用户 [{user}] | IPs: {', '.join(ips)} -> 已加入共享 {limit_val}Mbps 限速集合")
+                else:
+                    prev["dynamic_until"] = int(self.dyn_until.get(user, 0))
 
         # 评估已恢复正常的用户并自动移出限速集合
         for user in list(self.throttled_users.keys()):
@@ -1180,7 +1245,7 @@ class ClashRateLimiter:
                 self.remove_user_limit(iface, user)
                 del self.throttled_users[user]
                 rem_ips = active_user_ips.get(user, [])
-                log("INFO", f"[解除限速] 用户 [{user}] 活跃源 IP 数已恢复正常 ({len(rem_ips)} <= {ip_threshold}) -> 已移出限速集合")
+                log("INFO", f"[解除限速] 用户 [{user}] 活跃源 IP 数已恢复正常 ({len(rem_ips)} <= {ip_threshold}) 且无动态限速 -> 已移出限速集合")
 
         # 保存实时监控快照供 CLI 查看
         status_snapshot = {
@@ -1242,11 +1307,40 @@ class PushWebhookHandler(BaseHTTPRequestHandler):
             self._send_json(403, {"ok": False, "message": "server_id mismatch"})
             return
 
-        # 校验 Bearer Token 或 HMAC-SHA256 签名 (X-Dujiao-Signature / X-Signature)
-        auth_hdr = (self.headers.get("Authorization") or "").strip()
-        api_key_hdr = (self.headers.get("X-API-Key") or "").strip()
-        ts_hdr = (self.headers.get("X-Dujiao-Timestamp") or self.headers.get("X-Timestamp") or "").strip()
-        sig_hdr = (self.headers.get("X-Dujiao-Signature") or self.headers.get("X-Signature") or "").strip()
+        # 灵活兼容多种鉴权方式 (Bearer Token / Header Secret / HMAC-SHA256 / URL Query Token)
+        auth_hdr = (self.headers.get("Authorization") or self.headers.get("authorization") or "").strip()
+        token_extracted = re.sub(r"^(?:Bearer|Token)\s+", "", auth_hdr, flags=re.I).strip()
+        api_key_hdr = (
+            self.headers.get("X-API-Key")
+            or self.headers.get("X-Server-Secret")
+            or self.headers.get("X-Agent-Secret")
+            or self.headers.get("X-Token")
+            or self.headers.get("Token")
+            or self.headers.get("Secret")
+            or ""
+        ).strip()
+
+        # 检查 URL Query 参数中的 token/secret/key
+        query_params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        query_token = (
+            query_params.get("token", [""])[0]
+            or query_params.get("secret", [""])[0]
+            or query_params.get("key", [""])[0]
+            or query_params.get("api_key", [""])[0]
+        ).strip()
+
+        ts_hdr = (
+            self.headers.get("X-Dujiao-Timestamp")
+            or self.headers.get("X-Timestamp")
+            or self.headers.get("Timestamp")
+            or ""
+        ).strip()
+        sig_hdr = (
+            self.headers.get("X-Dujiao-Signature")
+            or self.headers.get("X-Signature")
+            or self.headers.get("Signature")
+            or ""
+        ).strip()
         if sig_hdr.startswith("sha256="):
             sig_hdr = sig_hdr[7:]
 
@@ -1254,21 +1348,43 @@ class PushWebhookHandler(BaseHTTPRequestHandler):
         if not secret:
             authed = True
         else:
-            if auth_hdr == f"Bearer {secret}" or api_key_hdr == secret:
+            clean_secret = secret.strip()
+            # 1. 直接匹配 Token 或 Header Secret 或 Query Token
+            if (
+                token_extracted == clean_secret
+                or auth_hdr == clean_secret
+                or api_key_hdr == clean_secret
+                or query_token == clean_secret
+            ):
                 authed = True
+            # 2. 匹配 HMAC-SHA256 签名 (覆盖所有常见拼接形式)
             elif sig_hdr:
                 candidates = [
-                    compute_hmac_sha256(secret, f"{ts_hdr}.{raw_body}"),
-                    compute_hmac_sha256(secret, f"{ts_hdr}\n{raw_body}"),
-                    compute_hmac_sha256(secret, f"{ts_hdr}{raw_body}"),
-                    compute_hmac_sha256(secret, raw_body),
+                    compute_hmac_sha256(clean_secret, f"{ts_hdr}.{raw_body}"),
+                    compute_hmac_sha256(clean_secret, f"{ts_hdr}{raw_body}"),
+                    compute_hmac_sha256(clean_secret, f"{ts_hdr}\n{raw_body}"),
+                    compute_hmac_sha256(clean_secret, f"{ts_hdr}:{raw_body}"),
+                    compute_hmac_sha256(clean_secret, f"{raw_body}.{ts_hdr}"),
+                    compute_hmac_sha256(clean_secret, raw_body),
                 ]
                 if any(hmac.compare_digest(sig_hdr.lower(), c.lower()) for c in candidates):
                     authed = True
 
         if not authed:
-            log("WARN", f"[Push拒绝] 来自 {self.client_address[0]} 的推送签名/密钥校验失败")
-            self._send_json(401, {"ok": False, "message": "unauthorized"})
+            headers_dict = {k: v for k, v in self.headers.items()}
+            masked_sec = f"{secret[:3]}***{secret[-3:]}" if len(secret) > 6 else "***"
+            log("WARN", f"[Push拒绝 401] 来源: {self.client_address[0]} | 接收 Headers: {json.dumps(headers_dict, ensure_ascii=False)} | 本地配置 API_KEY: {masked_sec}")
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            with open(os.path.join(CACHE_DIR, "last_rejected_push.json"), "w", encoding="utf-8") as f:
+                json.dump({
+                    "time": now_cst_str(),
+                    "client_ip": self.client_address[0],
+                    "path": self.path,
+                    "headers": headers_dict,
+                    "body": raw_body,
+                    "local_configured_secret_preview": masked_sec,
+                }, f, ensure_ascii=False, indent=2)
+            self._send_json(401, {"ok": False, "message": "unauthorized (secret or signature mismatch)", "client_ip": self.client_address[0]})
             return
 
         try:
@@ -1292,7 +1408,7 @@ class PushWebhookHandler(BaseHTTPRequestHandler):
 def run_daemon():
     cfg = load_env_config()
     port = int(cfg.get("AGENT_PORT") or 18080)
-    log("INFO", f"启动 sb-agent 守护进程 (v3.0.0) | Push 监听端口: {port} | 限速阈值: >{cfg.get('IP_THRESHOLD', '2')} IPs -> 共享 {cfg.get('LIMIT_MBPS', '10')}Mbps")
+    log("INFO", f"启动 sb-agent 守护进程 (v3.0.1) | Push 监听端口: {port} | 限速阈值: >{cfg.get('IP_THRESHOLD', '2')} IPs -> 共享 {cfg.get('LIMIT_MBPS', '10')}Mbps")
 
     # 启动时自动向面板执行一次协议上报与全量用户初始化
     if cfg.get("PANEL_URL") and cfg.get("API_KEY"):
@@ -1344,6 +1460,29 @@ if __name__ == "__main__":
         sys.exit(0 if ok else 1)
     elif cmd == "poll-once":
         RATE_LIMITER.poll_once()
+    elif cmd == "test-push":
+        cfg = load_env_config()
+        port = int(cfg.get("AGENT_PORT") or 18080)
+        secret = cfg.get("API_KEY", "")
+        test_payload = json.dumps({"server_id": int(cfg.get("SERVER_ID", 1)), "users": []}).encode()
+        ts = str(int(time.time()))
+        sig = compute_hmac_sha256(secret, f"{ts}.{test_payload.decode()}")
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {secret}",
+            "X-Server-Id": str(cfg.get("SERVER_ID", 1)),
+            "X-Dujiao-Timestamp": ts,
+            "X-Dujiao-Signature": sig,
+        }
+        url = f"http://127.0.0.1:{port}/api/v1/sync"
+        try:
+            req = urllib.request.Request(url, data=test_payload, headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                print(f"[测试通过] 本地 Push 响应 HTTP {resp.getcode()}: {resp.read().decode()}")
+        except urllib.error.HTTPError as he:
+            print(f"[测试失败] HTTP {he.code}: {he.read().decode()}")
+        except Exception as e:
+            print(f"[测试失败] 无法连接到本地 Push 服务: {e}")
     elif cmd == "clear-tc":
         cfg = load_env_config()
         ClashRateLimiter.clear_all_tc(cfg.get("NET_IFACE") or detect_default_iface())
@@ -1378,7 +1517,7 @@ setup_systemd_service() {
     if [[ -d /run/systemd/system ]]; then
         cat > "${SERVICE_FILE}" <<EOF
 [Unit]
-Description=sb-agent v3.0.0 (sing-box Panel Sync & Clash API Rate Limiter)
+Description=sb-agent v3.0.1 (sing-box Panel Sync & Clash API Rate Limiter)
 After=network.target sing-box.service
 
 [Service]
@@ -1598,7 +1737,7 @@ view_logs_menu() {
 }
 
 uninstall_all() {
-    echo -e "\n${RED}${BOLD}⚠️  确认卸载 sb-rotator (v3.0.0) 及其 Push 守护与限速规则吗？（不影响 sing-box 本身）${NC}"
+    echo -e "\n${RED}${BOLD}⚠️  确认卸载 sb-rotator (v3.0.1) 及其 Push 守护与限速规则吗？（不影响 sing-box 本身）${NC}"
     local confirm=""
     prompt_read "输入 y 确认卸载，其他键取消: " confirm || return 0
     [[ ! "${confirm}" =~ ^[Yy]$ ]] && { info "已取消卸载"; return 0; }
@@ -1692,6 +1831,7 @@ case "${1:-}" in
     --dry-run)               python3 "${DAEMON_SCRIPT}" dry-run ;;
     --sync-file)             python3 "${DAEMON_SCRIPT}" sync-file "${2:-}" ;;
     --poll-once)             python3 "${DAEMON_SCRIPT}" poll-once ;;
+    --test-push)             python3 "${DAEMON_SCRIPT}" test-push ;;
     --clear-limits)          python3 "${DAEMON_SCRIPT}" clear-tc ;;
     --config)                interactive_configure ;;
     --logs)                  tail -n 50 "${LOG_FILE}" 2>/dev/null || echo "暂无日志" ;;
@@ -1711,13 +1851,13 @@ __EOF_SB_ROTATOR_CORE__
 main() {
     check_root
     echo -e "\n${BOLD}${CYAN}=================================================================${NC}"
-    echo -e "${BOLD}   233boy/sing-box 面板动态同步 & Clash API 多IP限速一键脚本 v3.0.0${NC}"
+    echo -e "${BOLD}   233boy/sing-box 面板动态同步 & Clash API 多IP限速一键脚本 v3.0.1${NC}"
     echo -e "${BOLD}${CYAN}=================================================================${NC}"
 
     if [[ -x "${INSTALL_BIN}" && -f "${INSTALL_DIR}/config.env" && "${1:-}" == "" ]]; then
         echo -e "${GREEN}检测到本机已安装旧版或现有版本，请选择操作：${NC}"
-        echo -e "  ${GREEN}1)${NC} 升级/重装至 v3.0.0 并引导配置面板对接与多 IP 限速"
-        echo -e "  ${GREEN}2)${NC} 升级核心脚本至 v3.0.0 并立即上报协议同步用户 (--register)"
+        echo -e "  ${GREEN}1)${NC} 升级/重装至 v3.0.1 并引导配置面板对接与多 IP 限速"
+        echo -e "  ${GREEN}2)${NC} 升级核心脚本至 v3.0.1 并立即上报协议同步用户 (--register)"
         echo -e "  ${GREEN}3)${NC} 打开管理面板"
         echo -e "  ${RED}4)${NC} 一键卸载"
         echo -e "  ${GREEN}0)${NC} 退出"
@@ -1743,7 +1883,7 @@ main() {
 
     check_dependencies
     deploy_core_script
-    echo -e "${GREEN}[成功] 核心程序 v3.0.0 已安装至 ${INSTALL_BIN} (快捷命令: sbr)${NC}"
+    echo -e "${GREEN}[成功] 核心程序 v3.0.1 已安装至 ${INSTALL_BIN} (快捷命令: sbr)${NC}"
 
     "${INSTALL_BIN}" --config
 
@@ -1755,7 +1895,7 @@ main() {
     fi
 
     echo -e "\n${BOLD}${GREEN}=================================================================${NC}"
-    echo -e "${BOLD}${GREEN} 🎉 v3.0.0 部署完成！随时输入 ${YELLOW}sbr${GREEN} 即可查看协议、用户与实时限速状态${NC}"
+    echo -e "${BOLD}${GREEN} 🎉 v3.0.1 部署完成！随时输入 ${YELLOW}sbr${GREEN} 即可查看协议、用户与实时限速状态${NC}"
     echo -e "${BOLD}${GREEN}=================================================================${NC}"
 }
 
