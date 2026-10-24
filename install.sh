@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# install.sh - 233boy/sing-box 面板动态合租同步 & Clash API 多IP/动态流量共享限速 一键安装脚本 (v3.1.0)
+# install.sh - 233boy/sing-box 面板动态合租同步 & Clash API 多IP/动态流量共享限速 一键安装脚本 (v3.1.1)
 # 使用方式:
 #   bash <(curl -fsSL https://raw.githubusercontent.com/cpb66666/zidonghuanmi/main/install.sh)
 # ==============================================================================
@@ -70,12 +70,12 @@ deploy_core_script() {
     cat > "${INSTALL_BIN}" <<'__EOF_SB_ROTATOR_CORE__'
 #!/usr/bin/env bash
 # ==============================================================================
-# sb-rotator.sh - 233boy/sing-box 面板动态合租同步 & Clash API 多IP/动态流量限速系统 (v3.1.0)
+# sb-rotator.sh - 233boy/sing-box 面板动态合租同步 & Clash API 多IP/动态流量限速系统 (v3.1.1)
 # 核心能力:
 #   1. 自动扫描 /etc/sing-box/conf/*.json，提取管理员默认链接并通过 POST /api/v1/server/register 上报注册
 #   2. 同步响应 & Push 回调监听 (POST /api/v1/sync): 按协议 cred_type (uuid/password) 动态注入/移除合租用户，保留管理员默认账号
 #   3. 自动开启内置 Clash API (127.0.0.1:9090) + 注入 auth_user 路由标记，完整保留原 DNS 配置
-#   4. 双重共享限速引擎 (Linux TC HTB):
+#   4. 双重共享限速引擎 (Linux TC HTB + fq_codel):
 #      - 多IP共享限速: 实时监控各用户名活跃源 IP 数量，超阈值时将该用户所有源 IP 加入共享限速池
 #      - 动态流量限速: 滑动时间窗口内累计流量超阈值时，自动触发指定时长的共享带宽限速
 #   5. 支持交互式修改所有限速参数，并实时检验 Clash API、路由规则与内核 TC 限速队列是否真实生效
@@ -84,12 +84,13 @@ deploy_core_script() {
 set -o pipefail
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-VERSION="3.1.0"
+VERSION="3.1.1"
 INSTALL_DIR="${INSTALL_DIR:-/etc/sb-rotator}"
 CONFIG_FILE="${CONFIG_FILE:-${INSTALL_DIR}/config.env}"
 ADMIN_ACCOUNTS_FILE="${ADMIN_ACCOUNTS_FILE:-${INSTALL_DIR}/admin_accounts.json}"
 ACTIVE_USERS_FILE="${ACTIVE_USERS_FILE:-${INSTALL_DIR}/active_users.json}"
 RUNTIME_STATUS_FILE="${RUNTIME_STATUS_FILE:-${INSTALL_DIR}/runtime_status.json}"
+TRAFFIC_STATE_FILE="${TRAFFIC_STATE_FILE:-${INSTALL_DIR}/traffic_window.json}"
 DAEMON_SCRIPT="${DAEMON_SCRIPT:-${INSTALL_DIR}/sb_agent_daemon.py}"
 SERVICE_FILE="${SERVICE_FILE:-/etc/systemd/system/sb-agent.service}"
 BACKUP_DIR="${BACKUP_DIR:-${INSTALL_DIR}/backup}"
@@ -230,7 +231,7 @@ load_config() {
 save_config() {
     ensure_dirs
     cat > "${CONFIG_FILE}" <<EOF
-# sb-rotator v3.1.0 配置文件 (面板同步 + Clash API 多IP与动态流量限速)
+# sb-rotator v3.1.1 配置文件 (面板同步 + Clash API 多IP与动态流量限速)
 PANEL_URL="${PANEL_URL}"
 API_KEY="${API_KEY}"
 SERVER_ID="${SERVER_ID:-1}"
@@ -300,7 +301,7 @@ write_python_daemon() {
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-sb_agent_daemon.py - 233boy/sing-box 节点注册、Push 同步回调与 Clash API 多IP/动态流量限速守护进程 (v3.1.0)
+sb_agent_daemon.py - 233boy/sing-box 节点注册、Push 同步回调与 Clash API 多IP/动态流量限速守护进程 (v3.1.1)
 """
 
 import os
@@ -320,11 +321,13 @@ import urllib.error
 import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
+DAEMON_VERSION = "3.1.1"
 INSTALL_DIR = os.environ.get("INSTALL_DIR", "/etc/sb-rotator")
 CONFIG_FILE = os.environ.get("CONFIG_FILE", os.path.join(INSTALL_DIR, "config.env"))
 ADMIN_ACCOUNTS_FILE = os.environ.get("ADMIN_ACCOUNTS_FILE", os.path.join(INSTALL_DIR, "admin_accounts.json"))
 ACTIVE_USERS_FILE = os.environ.get("ACTIVE_USERS_FILE", os.path.join(INSTALL_DIR, "active_users.json"))
 RUNTIME_STATUS_FILE = os.environ.get("RUNTIME_STATUS_FILE", os.path.join(INSTALL_DIR, "runtime_status.json"))
+TRAFFIC_STATE_FILE = os.environ.get("TRAFFIC_STATE_FILE", os.path.join(INSTALL_DIR, "traffic_window.json"))
 CACHE_DIR = os.environ.get("CACHE_DIR", os.path.join(INSTALL_DIR, "cache"))
 LOG_FILE = os.environ.get("LOG_FILE", "/var/log/sb-rotator.log")
 SB_CONF_DIR = os.environ.get("SB_CONF_DIR", "/etc/sing-box/conf")
@@ -339,6 +342,11 @@ PROXY_URL_RE = re.compile(
 )
 AD_BLACKLIST_RE = re.compile(r"(getjms\.com|233boy\.com|github\.com|t\.me)", re.IGNORECASE)
 AUTH_USER_RULE_RE = re.compile(r"auth_user=\[?([^\s\]=>,]+)")
+
+# 协议封装开销补偿系数:
+# Linux TC 在网卡出方向按二/三层原始报文(含 Ethernet + IP + TCP/UDP + TLS/VLESS/Hysteria2 头部及上行 ACK)整形，
+# 补偿 15% 协议头与重传开销，使客户端测速应用层真实速度稳定对齐设定的 Mbps 数值。
+TC_OVERHEAD_FACTOR = 1.15
 
 RED = "\033[0;31m"
 GREEN = "\033[0;32m"
@@ -561,10 +569,6 @@ def build_fallback_url(proto, port, cred, shortname, inbound, srv_ip):
 
 
 def discover_and_get_default_protocols():
-    """
-    自动扫描 /etc/sing-box/conf/*.json，固定保存每个配置文件的管理员默认账号 (users[0])，
-    并提取每个协议的管理员默认分享链接 (default_links & protocols)。
-    """
     if not os.path.isdir(SB_CONF_DIR):
         return [], []
 
@@ -669,11 +673,6 @@ def discover_and_get_default_protocols():
 
 
 def ensure_clash_api_and_user_routes(active_emails, cfg):
-    """
-    在 /etc/sing-box/config.json 中开启内置 Clash API (127.0.0.1:9090)，
-    并为所有活跃用户注入 auth_user 路由规则以便 Clash API /connections 精确上报每个连接的归属用户名。
-    严格保留用户原有的 log、dns、outbounds 等全局配置！
-    """
     clash_port = cfg.get("CLASH_API_PORT", "9090")
     clash_secret = cfg.get("CLASH_API_SECRET", "")
     controller_addr = f"127.0.0.1:{clash_port}"
@@ -745,7 +744,6 @@ def ensure_clash_api_and_user_routes(active_emails, cfg):
 
 
 def reload_singbox():
-    """直接调用系统服务管理器平滑重启 sing-box，绝不调用 fix-config.json"""
     try:
         if os.path.isdir("/run/systemd/system"):
             subprocess.run(["systemctl", "restart", "sing-box"], timeout=15, check=False)
@@ -763,13 +761,6 @@ def reload_singbox():
 
 
 def sync_users_to_singbox(payload_data, cfg=None):
-    """
-    核心用户同步逻辑：
-    - 遍历本机协议配置文件 (/etc/sing-box/conf/*.json)
-    - 保留管理员默认账号 (users[0], name="admin")
-    - 根据协议 cred_type ("uuid" 或 "password") 为有效合租用户注入对应凭据 (name=user.email)
-    - 移除不在 users 列表中的历史合租用户及已过期用户
-    """
     with SYNC_LOCK:
         if cfg is None:
             cfg = load_env_config()
@@ -903,11 +894,6 @@ def compute_hmac_sha256(secret, message):
 
 
 def register_with_panel(dry_run=False):
-    """
-    接口一：POST /api/v1/server/register
-    上报本机 server_id、agent_url、replace_all、default_links 与 protocols，
-    并立即处理同步响应中的 data.users 完成首次用户初始化。
-    """
     cfg = load_env_config()
     default_links, protocols_list = discover_and_get_default_protocols()
     if not default_links:
@@ -973,7 +959,7 @@ def register_with_panel(dry_run=False):
         "X-Dujiao-Signature": sig,
         "X-Timestamp": ts,
         "X-Signature": sig,
-        "User-Agent": "sb-agent/3.1.0",
+        "User-Agent": f"sb-agent/{DAEMON_VERSION}",
     }
 
     log("STEP", f"正在向面板注册本机协议 ({len(default_links)} 个协议) -> {endpoint}")
@@ -1100,7 +1086,6 @@ def inspect_kernel_tc(iface):
 
 
 def inspect_clash_and_routes(cfg):
-    """检查 sing-box 全局配置中的 clash_api、auth_user 路由规则以及 Clash API 实时连通性"""
     clash_port = cfg.get("CLASH_API_PORT", "9090")
     clash_secret = cfg.get("CLASH_API_SECRET", "")
     info = {
@@ -1161,26 +1146,66 @@ class ClashRateLimiter:
         self.tc_initialized_iface = None
         self.conn_last = {}           # {conn_id: 上次累计字节数}
         self.conn_baselined = False   # 首轮仅建立基线，不计入历史流量
-        self.traffic_window = {}      # {username: [(ts, bytes), ...]}
+        self.traffic_window = {}      # {username: [[ts, bytes], ...]}
         self.dyn_until = {}           # {username: 动态限速结束时间戳}
-        self._restore_state_from_snapshot()
+        self.dyn_trigger_bytes = {}   # {username: 触发动态限速时的窗口累计字节数}
+        self._restore_state_from_disk()
 
-    def _restore_state_from_snapshot(self):
-        snap = load_json_file(RUNTIME_STATUS_FILE, {})
-        if not isinstance(snap, dict):
-            return
+    def _restore_state_from_disk(self):
         now = time.time()
-        throttled = snap.get("throttled_users") or {}
-        if isinstance(throttled, dict):
-            for user, info in throttled.items():
-                if not isinstance(info, dict):
-                    continue
-                du = int(info.get("dynamic_until") or 0)
-                if du > now:
-                    self.dyn_until[user] = float(du)
-                ips = info.get("ips") or []
-                if ips:
-                    self.last_known_ips[user] = list(ips)
+        # 1. 恢复持久化的滑动窗口流量记录与动态限速状态
+        tstate = load_json_file(TRAFFIC_STATE_FILE, {})
+        if isinstance(tstate, dict):
+            tw = tstate.get("traffic_window") or {}
+            if isinstance(tw, dict):
+                for u, samples in tw.items():
+                    if isinstance(samples, list):
+                        valid_s = [
+                            [float(item[0]), int(item[1])]
+                            for item in samples
+                            if isinstance(item, (list, tuple)) and len(item) == 2 and now - float(item[0]) <= 86400
+                        ]
+                        if valid_s:
+                            self.traffic_window[u] = valid_s
+            du_map = tstate.get("dyn_until") or {}
+            if isinstance(du_map, dict):
+                for u, du in du_map.items():
+                    if float(du or 0) > now:
+                        self.dyn_until[u] = float(du)
+            tb_map = tstate.get("dyn_trigger_bytes") or {}
+            if isinstance(tb_map, dict):
+                for u, tb in tb_map.items():
+                    if int(tb or 0) > 0:
+                        self.dyn_trigger_bytes[u] = int(tb)
+
+        # 2. 兼容从 runtime_status.json 恢复受限状态
+        snap = load_json_file(RUNTIME_STATUS_FILE, {})
+        if isinstance(snap, dict):
+            throttled = snap.get("throttled_users") or {}
+            if isinstance(throttled, dict):
+                for user, info in throttled.items():
+                    if not isinstance(info, dict):
+                        continue
+                    du = int(info.get("dynamic_until") or 0)
+                    if du > now:
+                        self.dyn_until[user] = float(du)
+                    wb = int(info.get("window_bytes") or 0)
+                    if wb > 0 and user not in self.dyn_trigger_bytes:
+                        self.dyn_trigger_bytes[user] = wb
+                    ips = info.get("ips") or []
+                    if ips:
+                        self.last_known_ips[user] = list(ips)
+
+    def _persist_traffic_state(self):
+        try:
+            save_json_file(TRAFFIC_STATE_FILE, {
+                "updated_at": int(time.time()),
+                "traffic_window": self.traffic_window,
+                "dyn_until": self.dyn_until,
+                "dyn_trigger_bytes": self.dyn_trigger_bytes,
+            })
+        except Exception:
+            pass
 
     def _get_cid(self, username):
         if username not in self.user_cid_map:
@@ -1198,16 +1223,25 @@ class ClashRateLimiter:
             pass
 
         try:
-            for mod in ("sch_htb", "sch_sfq", "cls_u32"):
+            for mod in ("sch_htb", "sch_fq_codel", "sch_sfq", "cls_u32"):
                 try:
                     subprocess.run(["modprobe", mod], stderr=subprocess.DEVNULL, check=False, timeout=3)
                 except Exception:
                     pass
-            p1 = subprocess.run(["tc", "qdisc", "replace", "dev", iface, "root", "handle", "1:", "htb", "default", "999"], capture_output=True, text=True, check=False, timeout=3)
+            p1 = subprocess.run(
+                ["tc", "qdisc", "replace", "dev", iface, "root", "handle", "1:", "htb", "default", "999", "r2q", "10"],
+                capture_output=True, text=True, check=False, timeout=3
+            )
             if p1.returncode != 0:
                 return False, (p1.stderr or "tc qdisc replace 失败").strip()
-            subprocess.run(["tc", "class", "replace", "dev", iface, "parent", "1:", "classid", "1:1", "htb", "rate", "10000mbit", "ceil", "10000mbit"], stderr=subprocess.DEVNULL, check=False, timeout=3)
-            subprocess.run(["tc", "class", "replace", "dev", iface, "parent", "1:1", "classid", "1:999", "htb", "rate", "10000mbit", "ceil", "10000mbit"], stderr=subprocess.DEVNULL, check=False, timeout=3)
+            subprocess.run(
+                ["tc", "class", "replace", "dev", iface, "parent", "1:", "classid", "1:1", "htb", "rate", "10000mbit", "ceil", "10000mbit", "burst", "2048kb", "cburst", "2048kb"],
+                stderr=subprocess.DEVNULL, check=False, timeout=3
+            )
+            subprocess.run(
+                ["tc", "class", "replace", "dev", iface, "parent", "1:1", "classid", "1:999", "htb", "rate", "10000mbit", "ceil", "10000mbit", "burst", "2048kb", "cburst", "2048kb"],
+                stderr=subprocess.DEVNULL, check=False, timeout=3
+            )
             self.tc_initialized_iface = iface
             return True, ""
         except Exception as e:
@@ -1219,10 +1253,21 @@ class ClashRateLimiter:
         if not ok:
             return False, err_msg
         cid = self._get_cid(username)
-        rate_str = f"{max(1, int(limit_mbps))}mbit"
+        target_mbps = max(1, int(limit_mbps))
+        # 补偿二/三层帧头、TCP/TLS/代理协议开销与上行 ACK 占用，并使用充足的 KB 级突发桶深以兼容网卡 64KB TSO/GSO 大包，
+        # 彻底解决原 burst 128k (仅16KB) + sfq perturb 10 乱序导致实测速度只有设定值一半 (~5Mbps) 的问题
+        wire_kbit = int(round(target_mbps * 1000 * TC_OVERHEAD_FACTOR))
+        rate_str = f"{wire_kbit}kbit"
+        burst_kb = max(512, target_mbps * 64)
+        burst_str = f"{burst_kb}kb"
+
         try:
             p_cls = subprocess.run(
-                ["tc", "class", "replace", "dev", iface, "parent", "1:1", "classid", f"1:{cid}", "htb", "rate", rate_str, "ceil", rate_str, "burst", "128k", "cburst", "128k"],
+                [
+                    "tc", "class", "replace", "dev", iface, "parent", "1:1", "classid", f"1:{cid}",
+                    "htb", "rate", rate_str, "ceil", rate_str,
+                    "burst", burst_str, "cburst", burst_str, "quantum", "15140",
+                ],
                 capture_output=True,
                 text=True,
                 check=False,
@@ -1231,12 +1276,22 @@ class ClashRateLimiter:
             if p_cls.returncode != 0:
                 return False, (p_cls.stderr or "tc class replace 失败").strip()
 
-            subprocess.run(
-                ["tc", "qdisc", "replace", "dev", iface, "parent", f"1:{cid}", "handle", f"{cid}:", "sfq", "perturb", "10"],
-                stderr=subprocess.DEVNULL,
+            # 优先使用 fq_codel (不重排同连接包序，支持高并发连接)，若内核不支持则回退至大队列 pfifo
+            p_qd = subprocess.run(
+                ["tc", "qdisc", "replace", "dev", iface, "parent", f"1:{cid}", "handle", f"{cid}:", "fq_codel", "limit", "4096", "quantum", "1514"],
+                capture_output=True,
+                text=True,
                 check=False,
                 timeout=3,
             )
+            if p_qd.returncode != 0:
+                subprocess.run(
+                    ["tc", "qdisc", "replace", "dev", iface, "parent", f"1:{cid}", "handle", f"{cid}:", "pfifo", "limit", "2000"],
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                    timeout=3,
+                )
+
             subprocess.run(
                 ["tc", "filter", "del", "dev", iface, "parent", "1:0", "prio", str(cid)],
                 stderr=subprocess.DEVNULL,
@@ -1280,9 +1335,11 @@ class ClashRateLimiter:
             self.tc_initialized_iface = None
             self.throttled_users.clear()
             self.dyn_until.clear()
+            self.dyn_trigger_bytes.clear()
             self.traffic_window.clear()
             self.user_ip_last_seen.clear()
             self.last_known_ips.clear()
+            self._persist_traffic_state()
         self.poll_once()
 
     @staticmethod
@@ -1341,7 +1398,7 @@ class ClashRateLimiter:
             try:
                 dyn_window_min = max(1.0, float(cfg.get("DYN_WINDOW_MIN", "40")))
                 dyn_window = dyn_window_min * 60.0
-                dyn_threshold_gb = max(0.01, float(cfg.get("DYN_THRESHOLD_GB", "2.5")))
+                dyn_threshold_gb = max(0.001, float(cfg.get("DYN_THRESHOLD_GB", "2.5")))
                 dyn_bytes = dyn_threshold_gb * (1024 ** 3)
                 dyn_mbps = max(1, int(float(cfg.get("DYN_LIMIT_MBPS", "10"))))
                 dyn_limit_min = max(1.0, float(cfg.get("DYN_LIMIT_MIN", "60")))
@@ -1376,6 +1433,7 @@ class ClashRateLimiter:
                     data = json.loads(resp.read().decode("utf-8", errors="ignore"))
             except Exception as e:
                 status_snapshot = {
+                    "daemon_version": DAEMON_VERSION,
                     "updated_at": int(now),
                     "updated_at_cst": now_cst_str(now),
                     "clash_api": f"127.0.0.1:{clash_port}",
@@ -1388,7 +1446,6 @@ class ClashRateLimiter:
                     "total_connections": 0,
                     "identified_connections": 0,
                     "active_users": {},
-                    "traffic_window_users": {},
                     "throttled_users": self.throttled_users,
                 }
                 save_json_file(RUNTIME_STATUS_FILE, status_snapshot)
@@ -1397,6 +1454,7 @@ class ClashRateLimiter:
             conns = data.get("connections") or []
             seen_conn_ids = set()
             identified_conns = 0
+            cycle_user_deltas = {}
 
             for c in conns:
                 if not isinstance(c, dict):
@@ -1416,7 +1474,11 @@ class ClashRateLimiter:
                     self.conn_last[cid_key] = total
                     delta = (total - last) if last is not None else (total if self.conn_baselined else 0)
                     if delta > 0:
-                        self.traffic_window.setdefault(user, []).append((now, delta))
+                        cycle_user_deltas[user] = cycle_user_deltas.get(user, 0) + delta
+
+            for u, d_bytes in cycle_user_deltas.items():
+                if d_bytes > 0:
+                    self.traffic_window.setdefault(u, []).append([round(now, 1), int(d_bytes)])
 
             for k in list(self.conn_last.keys()):
                 if k not in seen_conn_ids:
@@ -1443,27 +1505,32 @@ class ClashRateLimiter:
 
             if not dyn_enabled:
                 self.dyn_until.clear()
+                self.dyn_trigger_bytes.clear()
                 self.traffic_window.clear()
 
             for user in list(self.dyn_until.keys()):
                 if now >= self.dyn_until[user]:
                     del self.dyn_until[user]
+                    self.dyn_trigger_bytes.pop(user, None)
                     log("INFO", f"[动态限速到期] 用户 [{user}] 动态限速到期，按最近 {dyn_window_min:g} 分钟流量重新评估")
 
             user_window_bytes = {}
             for user in list(self.traffic_window.keys()):
-                samples = [(t, b) for t, b in self.traffic_window[user] if now - t <= dyn_window]
+                samples = [[t, b] for t, b in self.traffic_window[user] if now - t <= dyn_window]
                 if not samples:
                     del self.traffic_window[user]
                     continue
                 self.traffic_window[user] = samples
-                used = sum(b for _, b in samples)
+                used = int(sum(b for _, b in samples))
                 user_window_bytes[user] = used
-                if dyn_enabled and user not in self.dyn_until and used >= dyn_bytes:
-                    self.dyn_until[user] = now + dyn_dur
-                    log("WARN", f"[触发动态限速] 用户 [{user}] {dyn_window_min:g} 分钟内累计流量 {used / (1024 ** 3):.2f}GB >= {dyn_threshold_gb:g}GB -> 其所有源 IP 共享 {dyn_mbps}Mbps 限速 {dyn_limit_min:g} 分钟")
+                if dyn_enabled and used >= dyn_bytes:
+                    self.dyn_trigger_bytes[user] = max(used, self.dyn_trigger_bytes.get(user, 0))
+                    if user not in self.dyn_until:
+                        self.dyn_until[user] = now + dyn_dur
+                        log("WARN", f"[触发动态限速] 用户 [{user}] {dyn_window_min:g} 分钟内累计流量 {used / (1024 ** 3):.3f}GB >= {dyn_threshold_gb:g}GB -> 其所有源 IP 共享 {dyn_mbps}Mbps 限速 {dyn_limit_min:g} 分钟")
 
-            # 检查内核当前存在的 HTB 子类，防止外部清理后未自愈
+            self._persist_traffic_state()
+
             kernel_tc = inspect_kernel_tc(iface) if (self.throttled_users or active_user_ips or self.dyn_until) else {"classes": {}}
             existing_kernel_cids = set((kernel_tc.get("classes") or {}).keys())
 
@@ -1472,8 +1539,8 @@ class ClashRateLimiter:
             for user in all_eval_users:
                 ips = active_user_ips.get(user) or self.last_known_ips.get(user, [])
                 active_ips_now = active_user_ips.get(user, [])
-                ip_exceeded = ip_limit_enable and (len(active_ips_now) > ip_threshold)
-                dyn_active = dyn_enabled and (user in self.dyn_until)
+                ip_exceeded = bool(ip_limit_enable and (len(active_ips_now) > ip_threshold))
+                dyn_active = bool(dyn_enabled and (user in self.dyn_until) and (self.dyn_until[user] > now))
 
                 if ip_exceeded or dyn_active:
                     currently_exceeded.add(user)
@@ -1481,13 +1548,17 @@ class ClashRateLimiter:
                     if dyn_active:
                         limit_val = dyn_mbps if limit_val is None else min(limit_val, dyn_mbps)
 
+                    cur_win_bytes = user_window_bytes.get(user, 0)
+                    peak_bytes = max(cur_win_bytes, self.dyn_trigger_bytes.get(user, 0))
+
                     reasons = []
                     if ip_exceeded:
                         reasons.append(f"多IP超限(活跃{len(active_ips_now)}>{ip_threshold})")
                     if dyn_active:
-                        rem_min = max(1, int((self.dyn_until[user] - now + 59) // 60))
-                        used_gb = user_window_bytes.get(user, 0) / (1024 ** 3)
-                        reasons.append(f"动态流量超限({used_gb:.2f}GB>={dyn_threshold_gb:g}GB,剩余{rem_min}分钟)")
+                        rem_sec = max(1, int(self.dyn_until[user] - now))
+                        rem_m, rem_s = divmod(rem_sec, 60)
+                        peak_gb = peak_bytes / (1024 ** 3)
+                        reasons.append(f"动态流量超限(累计{peak_gb:.2f}GB>={dyn_threshold_gb:g}GB,剩余{rem_m}分{rem_s:02d}秒)")
 
                     cid = self._get_cid(user)
                     prev = self.throttled_users.get(user)
@@ -1511,8 +1582,9 @@ class ClashRateLimiter:
                             "dyn_active": dyn_active,
                             "dynamic_until": int(self.dyn_until.get(user, 0)),
                             "reasons": reasons,
-                            "window_bytes": user_window_bytes.get(user, 0),
-                            "window_gb": round(user_window_bytes.get(user, 0) / (1024 ** 3), 3),
+                            "window_bytes": cur_win_bytes,
+                            "trigger_bytes": peak_bytes,
+                            "window_gb": round(cur_win_bytes / (1024 ** 3), 4),
                             "tc_applied_ok": tc_ok,
                             "tc_error": tc_err,
                         }
@@ -1524,8 +1596,9 @@ class ClashRateLimiter:
                         prev["dyn_active"] = dyn_active
                         prev["dynamic_until"] = int(self.dyn_until.get(user, 0))
                         prev["reasons"] = reasons
-                        prev["window_bytes"] = user_window_bytes.get(user, 0)
-                        prev["window_gb"] = round(user_window_bytes.get(user, 0) / (1024 ** 3), 3)
+                        prev["window_bytes"] = cur_win_bytes
+                        prev["trigger_bytes"] = peak_bytes
+                        prev["window_gb"] = round(cur_win_bytes / (1024 ** 3), 4)
 
             for user in list(self.throttled_users.keys()):
                 if user not in currently_exceeded:
@@ -1537,19 +1610,25 @@ class ClashRateLimiter:
             active_users_detail = {}
             for u in sorted(set(active_user_ips.keys()) | set(user_window_bytes.keys()) | set(self.throttled_users.keys())):
                 u_ips = active_user_ips.get(u, [])
-                w_bytes = user_window_bytes.get(u, 0)
                 th_info = self.throttled_users.get(u)
+                w_bytes = user_window_bytes.get(u, 0)
+                t_bytes = max(w_bytes, self.dyn_trigger_bytes.get(u, 0), int((th_info or {}).get("trigger_bytes") or 0))
                 active_users_detail[u] = {
                     "ip_count": len(u_ips),
                     "ips": u_ips,
                     "window_bytes": w_bytes,
-                    "window_gb": round(w_bytes / (1024 ** 3), 3),
+                    "trigger_bytes": t_bytes,
+                    "window_gb": round(w_bytes / (1024 ** 3), 4),
                     "throttled": th_info is not None,
                     "limit_mbps": th_info.get("limit_mbps", 0) if th_info else 0,
+                    "ip_exceeded": bool(th_info.get("ip_exceeded")) if th_info else False,
+                    "dyn_active": bool(th_info.get("dyn_active")) if th_info else False,
+                    "dynamic_until": int(th_info.get("dynamic_until") or 0) if th_info else 0,
                     "reasons": th_info.get("reasons", []) if th_info else [],
                 }
 
             status_snapshot = {
+                "daemon_version": DAEMON_VERSION,
                 "updated_at": int(now),
                 "updated_at_cst": now_cst_str(now),
                 "clash_api": f"127.0.0.1:{clash_port}",
@@ -1575,6 +1654,7 @@ RATE_LIMITER = ClashRateLimiter()
 # ==============================================================================
 
 def format_bytes(num_bytes):
+    num_bytes = int(num_bytes or 0)
     if num_bytes >= 1024 ** 3:
         return f"{num_bytes / (1024 ** 3):.2f} GB"
     elif num_bytes >= 1024 ** 2:
@@ -1596,7 +1676,6 @@ def print_limit_status():
     updated_at = int(snap.get("updated_at") or 0)
     age_sec = (now - updated_at) if updated_at > 0 else -1
 
-    # 检查守护进程是否运行
     daemon_running = False
     try:
         if os.path.isdir("/run/systemd/system"):
@@ -1627,26 +1706,22 @@ def print_limit_status():
     print(f"  • {BOLD}巡检与网卡配置{NC}   : 绑定网卡 {BOLD}{CYAN}{iface}{NC} | 巡检间隔 {BOLD}{cfg.get('CHECK_INTERVAL', '5')}s{NC} | 管理员账号(admin): {adm_badge}")
 
     print(f"\n{BOLD}{CYAN}================ [二] 限速是否生效 (底层组件实时诊断) ================{NC}")
-    # 1. 守护进程状态
     if daemon_running:
         age_str = f"{age_sec} 秒前 ({snap.get('updated_at_cst', '-')})" if age_sec >= 0 else "刚刚"
-        print(f"  1. 守护进程 (sb-agent) : {GREEN}✅ 运行中{NC} | 最近一次巡检采样: {age_str}")
+        print(f"  1. 守护进程 (sb-agent) : {GREEN}✅ 运行中 (v{snap.get('daemon_version', DAEMON_VERSION)}){NC} | 最近一次巡检采样: {age_str}")
     else:
         print(f"  1. 守护进程 (sb-agent) : {RED}❌ 未运行{NC} (请在菜单中选择重启后台守护服务)")
 
-    # 2. Clash API 状态
     if clash_info["api_reachable"]:
         print(f"  2. Clash API 监控接口  : {GREEN}✅ 正常连通{NC} ({clash_info['clash_addr']}) | 实时活跃总连接: {BOLD}{clash_info['live_total_conns']}{NC} 条 (已识别用户连接: {BOLD}{clash_info['live_identified_conns']}{NC} 条)")
     else:
         print(f"  2. Clash API 监控接口  : {RED}❌ 无法连接{NC} ({clash_info['clash_addr']}) | 错误: {clash_info['api_error'] or '请确认 sing-box 正在运行'}")
 
-    # 3. auth_user 路由注入状态
     if clash_info["config_clash_enabled"] and clash_info["config_auth_user_count"] > 0:
         print(f"  3. 用户流量追踪规则    : {GREEN}✅ 已生效{NC} (config.json 已开启 Clash API 并注入 {clash_info['config_auth_user_count']} 名用户的 auth_user 规则)")
     else:
         print(f"  3. 用户流量追踪规则    : {YELLOW}⚠️ 待注入{NC} (将在面板同步或注册时自动写入 /etc/sing-box/config.json)")
 
-    # 4. Linux 内核 TC 队列状态
     active_cls_cnt = len(tc_info.get("classes") or {})
     if not tc_info["iface_exists"]:
         print(f"  4. 内核 TC 限速引擎    : {RED}❌ 绑定网卡 {iface} 不存在{NC} (请在限速配置菜单中修改绑定网卡)")
@@ -1655,7 +1730,6 @@ def print_limit_status():
     else:
         print(f"  4. 内核 TC 限速引擎    : {GREEN}🟢 就绪待命{NC} (网卡 {iface} 正常，当前无超限用户，触发限速时自动挂载 HTB 队列)")
 
-    # 综合生效结论
     overall_ok = daemon_running and clash_info["api_reachable"] and tc_info["iface_exists"] and (ip_en or dyn_en)
     if overall_ok:
         print(f"  >>> {BOLD}限速系统整体状态   : {GREEN}✅ 限速监控已正常生效{NC}")
@@ -1666,28 +1740,76 @@ def print_limit_status():
 
     print(f"\n{BOLD}{CYAN}================ [三] 各用户实时活跃源 IP 与窗口流量统计 ================{NC}")
     active_users = snap.get("active_users") or {}
+    throttled_users = snap.get("throttled_users") or {}
+    tstate_disk = load_json_file(TRAFFIC_STATE_FILE, {})
+    disk_tw = (tstate_disk.get("traffic_window") or {}) if isinstance(tstate_disk, dict) else {}
+    disk_tb = (tstate_disk.get("dyn_trigger_bytes") or {}) if isinstance(tstate_disk, dict) else {}
+
     ip_thresh = int(cfg.get("IP_THRESHOLD", "2") or 2)
     dyn_thresh_gb = float(cfg.get("DYN_THRESHOLD_GB", "2.5") or 2.5)
     dyn_thresh_bytes = dyn_thresh_gb * (1024 ** 3)
-    dyn_win_min = cfg.get("DYN_WINDOW_MIN", "40")
+    dyn_win_min = float(cfg.get("DYN_WINDOW_MIN", "40") or 40)
+    dyn_win_sec = dyn_win_min * 60.0
 
-    if not active_users:
+    all_display_users = sorted(set(active_users.keys()) | set(throttled_users.keys()))
+    if not all_display_users:
         print("  当前无活跃用户连接或窗口流量记录")
     else:
-        for u, info in active_users.items():
-            ip_cnt = int(info.get("ip_count") or 0)
-            ips_list = info.get("ips") or []
-            w_bytes = int(info.get("window_bytes") or 0)
-            pct = (w_bytes / dyn_thresh_bytes * 100.0) if dyn_thresh_bytes > 0 else 0.0
-            throttled = bool(info.get("throttled"))
-            status_tag = f"{RED}⚠️ 限速中 ({info.get('limit_mbps')}Mbps){NC}" if throttled else f"{GREEN}正常{NC}"
+        for u in all_display_users:
+            info = active_users.get(u) or {}
+            tinfo = throttled_users.get(u) or {}
+            ips_list = info.get("ips") if info.get("ips") is not None else (tinfo.get("ips") or [])
+            ip_cnt = len(ips_list)
+
+            # 读取滑动窗口流量 (优先取 snapshot，其次从持久化文件与内核已整形流量兜底)
+            w_bytes = int(info.get("window_bytes") or tinfo.get("window_bytes") or 0)
+            if w_bytes == 0 and u in disk_tw and isinstance(disk_tw[u], list):
+                w_bytes = int(sum(int(item[1]) for item in disk_tw[u] if isinstance(item, (list, tuple)) and len(item) == 2 and now - float(item[0]) <= dyn_win_sec))
+
+            trig_bytes = max(
+                w_bytes,
+                int(info.get("trigger_bytes") or 0),
+                int(tinfo.get("trigger_bytes") or 0),
+                int(disk_tb.get(u) or 0),
+            )
+
+            # 若用户已处于限速但此前由旧版守护进程产生导致窗口记录为0，用内核 TC Class 已整形流量 + 阈值兜底展示
+            cid_u = int(tinfo.get("cid") or 0)
+            cls_u = (tc_info.get("classes") or {}).get(cid_u) or {}
+            if w_bytes == 0 and cls_u.get("sent_bytes", 0) > 0:
+                w_bytes = int(cls_u["sent_bytes"])
+
+            effective_bytes = max(w_bytes, trig_bytes) if (u in throttled_users and int(tinfo.get("dynamic_until") or 0) > now) else w_bytes
+            pct = (effective_bytes / dyn_thresh_bytes * 100.0) if dyn_thresh_bytes > 0 else 0.0
+
+            is_throttled = bool(info.get("throttled")) or (u in throttled_users)
+            if is_throttled:
+                lim_m = tinfo.get("limit_mbps") or info.get("limit_mbps") or cfg.get("LIMIT_MBPS", "10")
+                dyn_until_u = int(tinfo.get("dynamic_until") or info.get("dynamic_until") or 0)
+                is_ip_ex = bool(tinfo.get("ip_exceeded")) or (ip_en and ip_cnt > ip_thresh)
+                is_dyn_ex = bool(tinfo.get("dyn_active")) or (dyn_en and dyn_until_u > now)
+                tag_parts = []
+                if is_ip_ex:
+                    tag_parts.append("多IP超限")
+                if is_dyn_ex:
+                    tag_parts.append("动态流量超限")
+                if not tag_parts:
+                    tag_parts.append("限速生效中")
+                status_tag = f"{RED}🔴 限速生效中 ({lim_m}Mbps | {'+'.join(tag_parts)}){NC}"
+            else:
+                status_tag = f"{GREEN}正常{NC}"
+
             ips_str = ", ".join(ips_list) if ips_list else "当前无活跃连接"
+            ip_state_str = f"{RED}(已超阈值!){NC}" if (ip_en and ip_cnt > ip_thresh) else f"{GREEN}(未超限){NC}"
+            flow_note = ""
+            if trig_bytes > w_bytes and (u in throttled_users and int(tinfo.get("dynamic_until") or 0) > now):
+                flow_note = f" [触发限速时峰值: {format_bytes(trig_bytes)}]"
+
             print(f"  • 用户: {BOLD}{u}{NC} [{status_tag}]")
-            print(f"    ├─ 活跃源 IP 数 : {BOLD}{ip_cnt}{NC} / 阈值 {ip_thresh} 个 (IPs: {ips_str})")
-            print(f"    └─ {dyn_win_min}m 窗口流量 : {BOLD}{format_bytes(w_bytes)}{NC} / 阈值 {dyn_thresh_gb:g} GB ({pct:.1f}%)")
+            print(f"    ├─ 活跃源 IP 数 : {BOLD}{ip_cnt}{NC} / 阈值 {ip_thresh} 个 {ip_state_str} (IPs: {ips_str})")
+            print(f"    └─ {dyn_win_min:g}m 窗口流量 : {BOLD}{format_bytes(effective_bytes)}{NC} / 阈值 {dyn_thresh_gb:g} GB ({pct:.1f}%){flow_note}")
 
     print(f"\n{BOLD}{CYAN}================ [四] 当前触发限速用户及内核 TC 整形统计 ================{NC}")
-    throttled_users = snap.get("throttled_users") or {}
     if not throttled_users:
         print(f"  {GREEN}🟢 当前无任何用户触发限速 (所有用户源 IP 数与滑动窗口流量均在阈值范围内){NC}")
     else:
@@ -1695,9 +1817,22 @@ def print_limit_status():
             cid = int(tinfo.get("cid") or 0)
             limit_m = tinfo.get("limit_mbps", 10)
             ips = tinfo.get("ips") or []
-            reasons = tinfo.get("reasons") or []
-            reason_str = " + ".join(reasons) if reasons else ("动态流量超限" if tinfo.get("dyn_active") else "多IP超限")
+            ip_cnt = len(ips)
             dyn_until = int(tinfo.get("dynamic_until") or 0)
+
+            # 精确判定触发原因，兼容旧版状态快照，绝不在 IP 数未超阈值时误报“多IP超限”
+            is_ip_ex = bool(tinfo.get("ip_exceeded")) if "ip_exceeded" in tinfo else (ip_en and ip_cnt > ip_thresh)
+            is_dyn_ex = bool(tinfo.get("dyn_active")) if "dyn_active" in tinfo else (dyn_until > now)
+
+            reasons = list(tinfo.get("reasons") or [])
+            if not reasons:
+                if is_ip_ex:
+                    reasons.append(f"多IP超限(活跃{ip_cnt}>{ip_thresh})")
+                if is_dyn_ex:
+                    rem_sec = max(0, dyn_until - now)
+                    rem_m, rem_s = divmod(rem_sec, 60)
+                    reasons.append(f"动态流量超限(剩余{rem_m}分{rem_s:02d}秒)")
+            reason_str = " + ".join(reasons) if reasons else "动态流量超限"
             dyn_str = f" | 动态限速至: {now_cst_str(dyn_until)} CST" if dyn_until > now else ""
 
             cls_stat = (tc_info.get("classes") or {}).get(cid)
@@ -1708,7 +1843,7 @@ def print_limit_status():
             if cls_stat:
                 sent_str = format_bytes(cls_stat["sent_bytes"])
                 print(
-                    f"     └─ 内核 TC 验证 : {GREEN}✅ 内核规则已生效{NC} (Class 1:{cid}, 速率={cls_stat['rate']}, 过滤IP数={len(flt_ips)}) | "
+                    f"     └─ 内核 TC 验证 : {GREEN}✅ 内核规则已生效{NC} (Class 1:{cid}, 设定={limit_m}Mbps/内核线速={cls_stat['rate']}, 过滤IP数={len(flt_ips)}) | "
                     f"已整形流量: {BOLD}{sent_str}{NC} ({cls_stat['sent_pkts']} 包) | 超速整顿(overlimits): {BOLD}{cls_stat['overlimits']}{NC} 次 | 丢包(dropped): {cls_stat['dropped']}"
                 )
             else:
@@ -1717,21 +1852,18 @@ def print_limit_status():
 
 
 def run_tc_self_test():
-    """一键测试本机限速环境、Clash API 识别及 Linux 内核 TC HTB/SFQ/u32 规则是否真实可用"""
     cfg = load_env_config()
     iface = cfg.get("NET_IFACE") or detect_default_iface()
     print(f"\n{BOLD}{CYAN}================ 限速环境自检与内核 TC 生效实测 ================{NC}")
 
     all_passed = True
 
-    # 1. 检查网卡
     if os.path.exists(f"/sys/class/net/{iface}"):
         print(f"  [1/4] 物理网卡检查 ({iface})         : {GREEN}✅ 通过 (网卡存在){NC}")
     else:
         print(f"  [1/4] 物理网卡检查 ({iface})         : {RED}❌ 失败 (网卡 {iface} 不存在，请修改绑定网卡){NC}")
         all_passed = False
 
-    # 2. 实测内核 TC HTB 队列、子类与 u32 过滤器挂载
     test_cid = 899
     test_ip = "198.51.100.254"
     tc_ok = False
@@ -1743,13 +1875,18 @@ def run_tc_self_test():
             tc_detail = f"挂载 HTB 根队列失败: {err}"
         else:
             p1 = subprocess.run(
-                ["tc", "class", "replace", "dev", iface, "parent", "1:1", "classid", f"1:{test_cid}", "htb", "rate", "10mbit", "ceil", "10mbit"],
+                ["tc", "class", "replace", "dev", iface, "parent", "1:1", "classid", f"1:{test_cid}", "htb", "rate", "11500kbit", "ceil", "11500kbit", "burst", "640kb", "cburst", "640kb"],
                 capture_output=True, text=True, check=False, timeout=3
             )
             p2 = subprocess.run(
-                ["tc", "qdisc", "replace", "dev", iface, "parent", f"1:{test_cid}", "handle", f"{test_cid}:", "sfq", "perturb", "10"],
+                ["tc", "qdisc", "replace", "dev", iface, "parent", f"1:{test_cid}", "handle", f"{test_cid}:", "fq_codel", "limit", "4096"],
                 capture_output=True, text=True, check=False, timeout=3
             )
+            if p2.returncode != 0:
+                subprocess.run(
+                    ["tc", "qdisc", "replace", "dev", iface, "parent", f"1:{test_cid}", "handle", f"{test_cid}:", "pfifo", "limit", "2000"],
+                    capture_output=True, text=True, check=False, timeout=3
+                )
             p3 = subprocess.run(
                 ["tc", "filter", "add", "dev", iface, "parent", "1:0", "protocol", "ip", "prio", str(test_cid), "u32", "match", "ip", "dst", f"{test_ip}/32", "flowid", f"1:{test_cid}"],
                 capture_output=True, text=True, check=False, timeout=3
@@ -1757,7 +1894,6 @@ def run_tc_self_test():
             after_tc = inspect_kernel_tc(iface)
             cls_exists = test_cid in (after_tc.get("classes") or {})
             flt_exists = test_ip in ((after_tc.get("filters") or {}).get(test_cid) or [])
-            # 清理测试规则
             subprocess.run(["tc", "filter", "del", "dev", iface, "parent", "1:0", "prio", str(test_cid)], stderr=subprocess.DEVNULL, check=False, timeout=3)
             subprocess.run(["tc", "qdisc", "del", "dev", iface, "parent", f"1:{test_cid}"], stderr=subprocess.DEVNULL, check=False, timeout=3)
             subprocess.run(["tc", "class", "del", "dev", iface, "parent", "1:1", "classid", f"1:{test_cid}"], stderr=subprocess.DEVNULL, check=False, timeout=3)
@@ -1767,7 +1903,7 @@ def run_tc_self_test():
 
             if p1.returncode == 0 and p3.returncode == 0 and cls_exists and flt_exists:
                 tc_ok = True
-                tc_detail = f"成功在内核创建并验证 HTB 限速类 1:{test_cid} (10Mbit) 与 u32 IP 过滤规则"
+                tc_detail = f"成功在内核创建并验证 HTB 限速类 1:{test_cid} (10Mbps 补偿线速 11500kbit, burst 640kb) 与 u32 IP 过滤规则"
             else:
                 tc_detail = (p1.stderr or p3.stderr or "内核未返回创建的测试限速类").strip()
 
@@ -1777,7 +1913,6 @@ def run_tc_self_test():
         print(f"  [2/4] 内核 TC HTB 限速规则下发实测  : {RED}❌ 失败 ({tc_detail}){NC}")
         all_passed = False
 
-    # 3. 检查 sing-box config.json 路由追踪配置
     clash_info = inspect_clash_and_routes(cfg)
     if clash_info["config_clash_enabled"] and clash_info["config_auth_user_count"] > 0:
         print(f"  [3/4] sing-box auth_user 路由配置   : {GREEN}✅ 通过 (已配置 {clash_info['config_auth_user_count']} 名用户的流量追踪规则){NC}")
@@ -1792,7 +1927,6 @@ def run_tc_self_test():
             else:
                 all_passed = False
 
-    # 4. 检查 Clash API 实时连接获取
     if clash_info["api_reachable"]:
         print(f"  [4/4] Clash API 接口连通性测试      : {GREEN}✅ 通过 ({clash_info['clash_addr']} 响应正常，当前连接数: {clash_info['live_total_conns']}){NC}")
     else:
@@ -1826,25 +1960,27 @@ class PushWebhookHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path in ("/health", "/api/v1/health", "/ping"):
             status = load_json_file(RUNTIME_STATUS_FILE, {})
-            self._send_json(200, {"ok": True, "version": "3.1.0", "status": status})
+            self._send_json(200, {"ok": True, "version": DAEMON_VERSION, "status": status})
         else:
             self._send_json(404, {"ok": False, "message": "not found"})
 
     def do_POST(self):
         clean_path = self.path.split("?", 1)[0].rstrip("/")
 
-        # 本地 CLI 管理端点 (仅允许 127.0.0.1 调用，实现热重载限速配置与清理状态)
         if self.client_address[0] == "127.0.0.1" and clean_path in ("/api/v1/reload-config", "/api/v1/clear-limits"):
             cfg = load_env_config()
             iface = cfg.get("NET_IFACE") or detect_default_iface()
             if clean_path == "/api/v1/clear-limits":
                 RATE_LIMITER.reset_all_state(iface)
                 log("INFO", "已通过本地管理指令清空所有内核 TC 限速规则与动态限速状态")
-                self._send_json(200, {"ok": True, "message": "all rate limits cleared"})
+                self._send_json(200, {"ok": True, "version": DAEMON_VERSION, "message": "all rate limits cleared"})
             else:
+                # 强制刷新当前受限用户的 TC 规则参数以立即应用新带宽/补偿系数
+                with LIMIT_LOCK:
+                    RATE_LIMITER.throttled_users.clear()
                 RATE_LIMITER.poll_once()
-                log("INFO", "已热重载最新限速配置参数并立即完成一轮巡检评估")
-                self._send_json(200, {"ok": True, "message": "rate limit config reloaded"})
+                log("INFO", "已热重载最新限速配置参数并立即重新下发内核 TC 规则")
+                self._send_json(200, {"ok": True, "version": DAEMON_VERSION, "message": "rate limit config reloaded"})
             return
 
         if clean_path not in ("/api/v1/sync", "/api/v1/node/sync", "/sync"):
@@ -1965,7 +2101,8 @@ def notify_local_daemon(endpoint):
     try:
         req = urllib.request.Request(url, data=b"{}", headers={"Content-Type": "application/json"}, method="POST")
         with urllib.request.urlopen(req, timeout=3) as resp:
-            return resp.getcode() == 200
+            body = json.loads(resp.read().decode("utf-8", errors="ignore"))
+            return resp.getcode() == 200 and body.get("version") == DAEMON_VERSION
     except Exception:
         return False
 
@@ -1973,9 +2110,15 @@ def notify_local_daemon(endpoint):
 def run_daemon():
     cfg = load_env_config()
     port = int(cfg.get("AGENT_PORT") or 18080)
+    iface = cfg.get("NET_IFACE") or detect_default_iface()
+    # 启动时清理旧版遗留的 128k/sfq TC 队列，以便按最新补偿线速与 fq_codel 重建
+    ClashRateLimiter.clear_all_tc(iface)
+    RATE_LIMITER.tc_initialized_iface = None
+    RATE_LIMITER.throttled_users.clear()
+
     log(
         "INFO",
-        f"启动 sb-agent 守护进程 (v3.1.0) | Push端口: {port} | "
+        f"启动 sb-agent 守护进程 (v{DAEMON_VERSION}) | Push端口: {port} | "
         f"多IP限速({cfg.get('IP_LIMIT_ENABLE','true')}): >{cfg.get('IP_THRESHOLD', '2')} IPs -> {cfg.get('LIMIT_MBPS', '10')}Mbps | "
         f"动态限速({cfg.get('DYN_LIMIT_ENABLE','true')}): {cfg.get('DYN_WINDOW_MIN','40')}m>={cfg.get('DYN_THRESHOLD_GB','2.5')}GB -> {cfg.get('DYN_LIMIT_MBPS','10')}Mbps({cfg.get('DYN_LIMIT_MIN','60')}m)"
     )
@@ -2034,7 +2177,7 @@ if __name__ == "__main__":
         run_tc_self_test()
     elif cmd == "reload-config":
         if not notify_local_daemon("/api/v1/reload-config"):
-            RATE_LIMITER.poll_once()
+            sys.exit(1)
     elif cmd == "test-push":
         cfg = load_env_config()
         port = int(cfg.get("AGENT_PORT") or 18080)
@@ -2063,6 +2206,7 @@ if __name__ == "__main__":
         iface = cfg.get("NET_IFACE") or detect_default_iface()
         if not notify_local_daemon("/api/v1/clear-limits"):
             ClashRateLimiter.clear_all_tc(iface)
+            save_json_file(TRAFFIC_STATE_FILE, {"updated_at": int(time.time()), "traffic_window": {}, "dyn_until": {}, "dyn_trigger_bytes": {}})
             snap = load_json_file(RUNTIME_STATUS_FILE, {})
             if isinstance(snap, dict):
                 snap["throttled_users"] = {}
@@ -2094,6 +2238,19 @@ is_daemon_running() {
     systemctl is-active --quiet sb-agent.service 2>/dev/null || pgrep -f "${DAEMON_SCRIPT} daemon" >/dev/null 2>&1
 }
 
+ensure_daemon_latest() {
+    write_python_daemon
+    if is_daemon_running; then
+        local running_ver
+        running_ver="$(jq -r '.daemon_version // ""' "${RUNTIME_STATUS_FILE}" 2>/dev/null || echo "")"
+        if [[ "${running_ver}" != "${VERSION}" ]]; then
+            info "检测到后台守护进程版本 (${running_ver:-旧版}) 与当前脚本 (v${VERSION}) 不一致，正在自动平滑升级守护服务..."
+            setup_systemd_service
+            sleep 1
+        fi
+    fi
+}
+
 setup_systemd_service() {
     load_config
     write_python_daemon
@@ -2102,7 +2259,7 @@ setup_systemd_service() {
     if [[ -d /run/systemd/system ]]; then
         cat > "${SERVICE_FILE}" <<EOF
 [Unit]
-Description=sb-agent v3.1.0 (sing-box Panel Sync & Clash API Rate Limiter)
+Description=sb-agent v${VERSION} (sing-box Panel Sync & Clash API Rate Limiter)
 After=network.target sing-box.service
 
 [Service]
@@ -2121,23 +2278,22 @@ EOF
         systemctl daemon-reload >/dev/null 2>&1 || true
         systemctl enable sb-agent.service >/dev/null 2>&1 || true
         systemctl restart sb-agent.service >/dev/null 2>&1 || true
-        info "已部署并启动后台守护服务 sb-agent.service (Push 回调端口: ${AGENT_PORT:-18080})"
+        info "已部署并重启后台守护服务 sb-agent.service (v${VERSION}, Push 回调端口: ${AGENT_PORT:-18080})"
     else
         pkill -f "${DAEMON_SCRIPT}" 2>/dev/null || true
         nohup python3 "${DAEMON_SCRIPT}" daemon >> "${LOG_FILE}" 2>&1 &
-        info "已在后台启动 sb-agent 守护进程 (Push 回调端口: ${AGENT_PORT:-18080})"
+        info "已在后台启动 sb-agent 守护进程 (v${VERSION}, Push 回调端口: ${AGENT_PORT:-18080})"
     fi
 }
 
 apply_rate_limit_config_live() {
     save_config
     write_python_daemon
-    if is_daemon_running; then
-        python3 "${DAEMON_SCRIPT}" reload-config >/dev/null 2>&1 || setup_systemd_service
+    if is_daemon_running && python3 "${DAEMON_SCRIPT}" reload-config >/dev/null 2>&1; then
         info "限速参数已保存并实时热重载生效 (保留历史流量统计窗口)！"
     else
         setup_systemd_service
-        info "限速参数已保存并已启动后台守护进程生效！"
+        info "限速参数已保存并已重启后台守护进程至最新 v${VERSION} 生效！"
     fi
 }
 
@@ -2159,7 +2315,7 @@ stop_systemd_service() {
 show_status_table() {
     load_config
     ensure_dirs
-    write_python_daemon
+    ensure_daemon_latest
 
     echo -e "\n${BOLD}${CYAN}================ 本机 sing-box 协议列表与默认分享链接 ================${NC}"
     local disc_json
@@ -2187,7 +2343,7 @@ show_status_table() {
 show_connections_and_limits() {
     load_config
     ensure_dirs
-    write_python_daemon
+    ensure_daemon_latest
     python3 "${DAEMON_SCRIPT}" limit-status
 }
 
@@ -2255,7 +2411,7 @@ interactive_configure() {
 
 configure_rate_limit_menu() {
     ensure_dirs
-    write_python_daemon
+    ensure_daemon_latest
     while true; do
         load_config
         local ip_en_str="${GREEN}已开启${NC}"
@@ -2461,7 +2617,7 @@ uninstall_all() {
 main_menu() {
     load_config
     ensure_dirs
-    write_python_daemon
+    ensure_daemon_latest
     while true; do
         load_config
         local daemon_status="${RED}未运行${NC}"
@@ -2530,6 +2686,7 @@ usage() {
 无参数                  打开交互式管理面板
 --register              立即调用 POST /api/v1/server/register 上报协议默认链接并同步在席用户
 --daemon                在前台运行 Push 回调监听与 Clash API 动态限速守护进程
+--restart-daemon        重新释放最新守护脚本并重启 sb-agent.service
 --status                查看本机所有协议默认链接与当前在席合租用户
 --limits / --connections 查看当前限速参数、限速是否生效、各用户活跃 IP 与窗口流量统计
 --limit-config          进入交互式限速参数修改与管理菜单
@@ -2546,8 +2703,9 @@ ensure_dirs
 write_python_daemon
 
 case "${1:-}" in
-    --register|--init|--run)   python3 "${DAEMON_SCRIPT}" register ;;
+    --register|--init|--run)   ensure_daemon_latest; python3 "${DAEMON_SCRIPT}" register ;;
     --daemon)                  python3 "${DAEMON_SCRIPT}" daemon ;;
+    --restart-daemon)          setup_systemd_service ;;
     --status)                  show_status_table ;;
     --connections|--limits)    show_connections_and_limits ;;
     --limit-config)            configure_rate_limit_menu ;;
@@ -2575,14 +2733,14 @@ __EOF_SB_ROTATOR_CORE__
 main() {
     check_root
     echo -e "\n${BOLD}${CYAN}=================================================================${NC}"
-    echo -e "${BOLD}   233boy/sing-box 面板动态同步 & Clash API 多IP/动态限速脚本 v3.1.0${NC}"
+    echo -e "${BOLD}   233boy/sing-box 面板动态同步 & Clash API 多IP/动态限速脚本 v3.1.1${NC}"
     echo -e "${BOLD}${CYAN}=================================================================${NC}"
 
     if [[ -x "${INSTALL_BIN}" && -f "${INSTALL_DIR}/config.env" && "${1:-}" == "" ]]; then
         echo -e "${GREEN}检测到本机已安装旧版或现有版本，请选择操作：${NC}"
-        echo -e "  ${GREEN}1)${NC} 升级核心脚本至 v3.1.0 并打开管理面板 (保留现有配置)"
-        echo -e "  ${GREEN}2)${NC} 升级核心脚本至 v3.1.0 并立即上报协议同步用户 (--register)"
-        echo -e "  ${GREEN}3)${NC} 升级/重装至 v3.1.0 并重新运行配置向导 (--config)"
+        echo -e "  ${GREEN}1)${NC} 升级核心与守护进程至 v3.1.1 并打开管理面板 (保留现有配置)"
+        echo -e "  ${GREEN}2)${NC} 升级核心与守护进程至 v3.1.1 并立即上报协议同步用户 (--register)"
+        echo -e "  ${GREEN}3)${NC} 升级/重装至 v3.1.1 并重新运行配置向导 (--config)"
         echo -e "  ${RED}4)${NC} 一键卸载"
         echo -e "  ${GREEN}0)${NC} 退出"
         local exist_opt=""
@@ -2591,12 +2749,13 @@ main() {
             1)
                 check_dependencies
                 deploy_core_script
-                "${INSTALL_BIN}" --poll-once >/dev/null 2>&1 || true
+                "${INSTALL_BIN}" --restart-daemon
                 exec "${INSTALL_BIN}"
                 ;;
             2)
                 check_dependencies
                 deploy_core_script
+                "${INSTALL_BIN}" --restart-daemon
                 "${INSTALL_BIN}" --register || true
                 exec "${INSTALL_BIN}"
                 ;;
@@ -2608,7 +2767,7 @@ main() {
 
     check_dependencies
     deploy_core_script
-    echo -e "${GREEN}[成功] 核心程序 v3.1.0 已安装至 ${INSTALL_BIN} (快捷命令: sbr)${NC}"
+    echo -e "${GREEN}[成功] 核心程序 v3.1.1 已安装至 ${INSTALL_BIN} (快捷命令: sbr)${NC}"
 
     "${INSTALL_BIN}" --config
 
@@ -2620,7 +2779,7 @@ main() {
     fi
 
     echo -e "\n${BOLD}${GREEN}=================================================================${NC}"
-    echo -e "${BOLD}${GREEN} 🎉 v3.1.0 部署完成！随时输入 ${YELLOW}sbr${GREEN} 即可修改限速参数与查看限速生效状态${NC}"
+    echo -e "${BOLD}${GREEN} 🎉 v3.1.1 部署完成！随时输入 ${YELLOW}sbr${GREEN} 即可修改限速参数与查看限速生效状态${NC}"
     echo -e "${BOLD}${GREEN}=================================================================${NC}"
 }
 
