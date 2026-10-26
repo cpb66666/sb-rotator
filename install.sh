@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# install.sh - 233boy/sing-box 面板动态合租同步 & Clash API 多IP/动态流量共享限速 一键安装脚本 (v3.1.2)
+# install.sh - 233boy/sing-box 面板动态合租同步 & Clash API 多IP/动态流量共享限速 一键安装脚本 (v3.1.3)
 # 使用方式:
 #   bash <(curl -fsSL https://raw.githubusercontent.com/cpb66666/zidonghuanmi/main/install.sh)
 # ==============================================================================
@@ -70,7 +70,7 @@ deploy_core_script() {
     cat > "${INSTALL_BIN}" <<'__EOF_SB_ROTATOR_CORE__'
 #!/usr/bin/env bash
 # ==============================================================================
-# sb-rotator.sh - 233boy/sing-box 面板动态合租同步 & Clash API 多IP/动态流量限速系统 (v3.1.2)
+# sb-rotator.sh - 233boy/sing-box 面板动态合租同步 & Clash API 多IP/动态流量限速系统 (v3.1.3)
 # 核心能力:
 #   1. 自动扫描 /etc/sing-box/conf/*.json，提取管理员默认链接并通过 POST /api/v1/server/register 上报注册
 #   2. 同步响应 & Push 回调监听 (POST /api/v1/sync): 按协议 cred_type (uuid/password) 动态注入/移除合租用户，保留管理员默认账号
@@ -84,7 +84,7 @@ deploy_core_script() {
 set -o pipefail
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-VERSION="3.1.2"
+VERSION="3.1.3"
 INSTALL_DIR="${INSTALL_DIR:-/etc/sb-rotator}"
 CONFIG_FILE="${CONFIG_FILE:-${INSTALL_DIR}/config.env}"
 ADMIN_ACCOUNTS_FILE="${ADMIN_ACCOUNTS_FILE:-${INSTALL_DIR}/admin_accounts.json}"
@@ -231,7 +231,7 @@ load_config() {
 save_config() {
     ensure_dirs
     cat > "${CONFIG_FILE}" <<EOF
-# sb-rotator v3.1.2 配置文件 (面板同步 + Clash API 多IP与动态流量限速)
+# sb-rotator v3.1.3 配置文件 (面板同步 + Clash API 多IP与动态流量限速)
 PANEL_URL="${PANEL_URL}"
 API_KEY="${API_KEY}"
 SERVER_ID="${SERVER_ID:-1}"
@@ -301,7 +301,7 @@ write_python_daemon() {
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-sb_agent_daemon.py - 233boy/sing-box 节点注册、Push 同步回调与 Clash API 多IP/动态流量限速守护进程 (v3.1.2)
+sb_agent_daemon.py - 233boy/sing-box 节点注册、Push 同步回调与 Clash API 多IP/动态流量限速守护进程 (v3.1.3)
 """
 
 import os
@@ -312,6 +312,7 @@ import time
 import hmac
 import shlex
 import socket
+import base64
 import hashlib
 import logging
 import threading
@@ -332,7 +333,7 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
         self.server_name = "sb-agent"
         self.server_port = self.server_address[1]
 
-DAEMON_VERSION = "3.1.2"
+DAEMON_VERSION = "3.1.3"
 INSTALL_DIR = os.environ.get("INSTALL_DIR", "/etc/sb-rotator")
 CONFIG_FILE = os.environ.get("CONFIG_FILE", os.path.join(INSTALL_DIR, "config.env"))
 ADMIN_ACCOUNTS_FILE = os.environ.get("ADMIN_ACCOUNTS_FILE", os.path.join(INSTALL_DIR, "admin_accounts.json"))
@@ -343,6 +344,8 @@ CACHE_DIR = os.environ.get("CACHE_DIR", os.path.join(INSTALL_DIR, "cache"))
 LOG_FILE = os.environ.get("LOG_FILE", "/var/log/sb-rotator.log")
 SB_CONF_DIR = os.environ.get("SB_CONF_DIR", "/etc/sing-box/conf")
 SB_GLOBAL_CONFIG = os.environ.get("SB_GLOBAL_CONFIG", "/etc/sing-box/config.json")
+CADDY_CONF_DIR = os.environ.get("CADDY_CONF_DIR", "/etc/caddy/233boy")
+CADDY_MAIN_FILE = os.environ.get("CADDY_MAIN_FILE", "/etc/caddy/Caddyfile")
 
 SYNC_LOCK = threading.Lock()
 LIMIT_LOCK = threading.Lock()
@@ -560,23 +563,232 @@ def extract_proxy_url(text):
     return ""
 
 
+def parse_caddy_tls_proxy(listen_port, shortname):
+    """
+    扫描 /etc/caddy/233boy/*.conf 及节点文件名，识别通过 Caddy 反代本地端口 (如 127.0.0.1:63708) 的 WS-TLS 节点，
+    提取真实的外部域名 (host/sni)、外部 HTTPS 端口 (默认 443) 与反代路径 (path)。
+    支持用户移除了 transport.headers.host 并自定义了 path / max_early_data 的修改版配置。
+    """
+    default_https_port = 443
+    if os.path.isfile(CADDY_MAIN_FILE):
+        try:
+            with open(CADDY_MAIN_FILE, "r", encoding="utf-8", errors="ignore") as f:
+                m_hp = re.search(r"^\s*https_port\s+(\d+)", f.read(), re.M)
+                if m_hp:
+                    default_https_port = int(m_hp.group(1))
+        except Exception:
+            pass
+
+    domain_from_name = ""
+    m_name = re.match(r"^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*-TLS-(.+)$", shortname, re.I)
+    if m_name:
+        domain_from_name = m_name.group(1).strip()
+
+    matched_domain = ""
+    matched_port = default_https_port
+    matched_path = ""
+
+    if os.path.isdir(CADDY_CONF_DIR):
+        try:
+            cfiles = sorted([f for f in os.listdir(CADDY_CONF_DIR) if f.endswith(".conf")])
+        except Exception:
+            cfiles = []
+
+        # 1) 优先按 reverse_proxy 127.0.0.1:<listen_port> 精确匹配 Caddy 配置文件
+        for cf in cfiles:
+            cpath = os.path.join(CADDY_CONF_DIR, cf)
+            try:
+                with open(cpath, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+            except Exception:
+                continue
+            if listen_port and re.search(rf"reverse_proxy\s+(?:127\.0\.0\.1|localhost)?\s*:{listen_port}\b", content):
+                m_site = re.search(r"^\s*(?:https?://)?([A-Za-z0-9._-]+)(?::(\d+))?\s*\{", content, re.M)
+                if m_site:
+                    matched_domain = m_site.group(1).strip()
+                    if m_site.group(2):
+                        matched_port = int(m_site.group(2))
+                else:
+                    matched_domain = cf[:-5]
+                m_p = re.search(r"\bpath\s+(/[^\s*{}]+)", content)
+                if m_p:
+                    matched_path = m_p.group(1).strip()
+                break
+
+        # 2) 其次按文件名中的域名匹配 /etc/caddy/233boy/<domain>.conf
+        if not matched_domain and domain_from_name:
+            cand_conf = os.path.join(CADDY_CONF_DIR, f"{domain_from_name}.conf")
+            if os.path.isfile(cand_conf):
+                matched_domain = domain_from_name
+                try:
+                    with open(cand_conf, "r", encoding="utf-8", errors="ignore") as f:
+                        content = f.read()
+                    m_site = re.search(r"^\s*(?:https?://)?([A-Za-z0-9._-]+)(?::(\d+))?\s*\{", content, re.M)
+                    if m_site and m_site.group(2):
+                        matched_port = int(m_site.group(2))
+                    m_p = re.search(r"\bpath\s+(/[^\s*{}]+)", content)
+                    if m_p:
+                        matched_path = m_p.group(1).strip()
+                except Exception:
+                    pass
+
+    final_domain = matched_domain or domain_from_name
+    return {
+        "is_caddy_tls": bool(final_domain),
+        "domain": final_domain,
+        "port": matched_port if final_domain else listen_port,
+        "path": matched_path,
+    }
+
+
+def resolve_inbound_endpoint(shortname, inbound, srv_ip):
+    """
+    综合解析 sing-box inbound 配置、Caddy 反代配置与文件名，返回客户端真实连接参数。
+    """
+    listen = str(inbound.get("listen") or "").strip()
+    listen_port = int(inbound.get("listen_port") or 0)
+    if not listen_port:
+        m = re.search(r"-(\d+)$", shortname)
+        if m:
+            listen_port = int(m.group(1))
+
+    transport = inbound.get("transport") if isinstance(inbound.get("transport"), dict) else {}
+    net_type = str(transport.get("type") or "").lower().strip()
+    ws_path = str(transport.get("path") or "").strip()
+    headers = transport.get("headers") if isinstance(transport.get("headers"), dict) else {}
+    hdr_host = str(headers.get("host") or headers.get("Host") or "").strip()
+
+    tls_block = inbound.get("tls") if isinstance(inbound.get("tls"), dict) else {}
+    tls_sni = str(tls_block.get("server_name") or "").strip()
+    tls_enabled = bool(tls_block.get("enabled")) or bool(tls_sni)
+
+    caddy_info = parse_caddy_tls_proxy(listen_port, shortname)
+    is_caddy_tls = caddy_info["is_caddy_tls"] or ("-tls-" in shortname.lower()) or (listen == "127.0.0.1" and bool(hdr_host))
+
+    domain = hdr_host or caddy_info["domain"] or tls_sni
+    ext_port = caddy_info["port"] if is_caddy_tls else listen_port
+    if is_caddy_tls and (not ext_port or ext_port == listen_port):
+        ext_port = 443
+    final_path = ws_path or caddy_info["path"] or ("/" if net_type == "ws" else "")
+    is_tls = is_caddy_tls or tls_enabled
+
+    return {
+        "connect_host": domain if domain else srv_ip,
+        "domain": domain,
+        "ext_port": ext_port,
+        "listen_port": listen_port,
+        "net_type": net_type or "tcp",
+        "path": final_path,
+        "is_tls": is_tls,
+        "is_caddy_tls": is_caddy_tls,
+        "max_early_data": int(transport.get("max_early_data") or 0),
+        "early_data_header_name": str(transport.get("early_data_header_name") or ""),
+    }
+
+
+def build_vmess_base64_url(cred, shortname, inbound, srv_ip, ep=None):
+    """
+    构建标准 V2RayN Base64 JSON 格式的 vmess:// 节点分享链接，
+    完整支持修改后的 VMess-WS-TLS (Caddy 反代) 并在 TLS 模式下自动注入客户端 uTLS 指纹 fp=firefox。
+    """
+    if ep is None:
+        ep = resolve_inbound_endpoint(shortname, inbound, srv_ip)
+    connect_host = ep["connect_host"]
+    domain = ep["domain"] or connect_host
+    ext_port = ep["ext_port"]
+    net_type = ep["net_type"] or "ws"
+    ws_path = ep["path"] or "/"
+    is_tls = ep["is_tls"]
+
+    vmess_obj = {
+        "v": "2",
+        "ps": shortname,
+        "add": connect_host,
+        "port": str(ext_port),
+        "id": str(cred),
+        "aid": "0",
+        "scy": "auto",
+        "net": net_type,
+        "type": "none",
+        "host": domain if net_type in ("ws", "http", "h2", "httpupgrade") else "",
+        "path": ws_path if net_type in ("ws", "http", "h2", "grpc", "httpupgrade") else "",
+        "tls": "tls" if is_tls else "",
+        "sni": domain if is_tls else "",
+        "alpn": "",
+        "fp": "firefox" if is_tls else "",
+    }
+    raw_json = json.dumps(vmess_obj, ensure_ascii=False, separators=(",", ":"))
+    b64_str = base64.b64encode(raw_json.encode("utf-8")).decode("ascii")
+    return f"vmess://{b64_str}"
+
+
+def decode_vmess_url_summary(url):
+    if not url or not url.lower().startswith("vmess://"):
+        return ""
+    b64_part = url[8:].strip()
+    pad = (-len(b64_part)) % 4
+    try:
+        raw = base64.b64decode(b64_part + ("=" * pad)).decode("utf-8", errors="ignore")
+        obj = json.loads(raw)
+        if isinstance(obj, dict):
+            return (
+                f"地址={obj.get('add')}:{obj.get('port')} | 传输={obj.get('net')} | "
+                f"路径={obj.get('path') or '-'} | Host/SNI={obj.get('host') or obj.get('sni') or '-'} | "
+                f"TLS={obj.get('tls') or 'none'} | uTLS指纹(fp)={obj.get('fp') or '-'}"
+            )
+    except Exception:
+        pass
+    return ""
+
+
 def build_fallback_url(proto, port, cred, shortname, inbound, srv_ip):
-    tls = inbound.get("tls") or {}
-    sni = tls.get("server_name") or ""
+    ep = resolve_inbound_endpoint(shortname, inbound, srv_ip)
+    if proto == "vmess":
+        return build_vmess_base64_url(cred, shortname, inbound, srv_ip, ep=ep)
+
+    connect_host = ep["connect_host"]
+    ext_port = ep["ext_port"] or port
+    sni = ep["domain"] or ""
+    net_type = ep["net_type"]
+    ws_path = ep["path"]
     users = inbound.get("users") or [{}]
     first_u = users[0] if users else {}
     flow = first_u.get("flow") or ""
+
     if proto == "anytls":
-        q = f"security=tls&sni={sni}&insecure=1" if sni else "security=tls&insecure=1"
-        return f"anytls://{cred}@{srv_ip}:{port}?{q}#{shortname}"
+        q = f"security=tls&sni={sni}&fp=firefox&insecure=1" if sni else "security=tls&fp=firefox&insecure=1"
+        return f"anytls://{cred}@{connect_host}:{ext_port}?{q}#{shortname}"
     elif proto in ("hysteria2", "hy2"):
-        return f"hysteria2://{cred}@{srv_ip}:{port}?alpn=h3&insecure=1&sni={sni or 'www.bing.com'}#{shortname}"
+        return f"hysteria2://{cred}@{connect_host}:{ext_port}?alpn=h3&insecure=1&sni={sni or 'www.bing.com'}#{shortname}"
     elif proto == "vless":
-        q = f"encryption=none{f'&flow={flow}' if flow else ''}&security=tls{f'&sni={sni}' if sni else ''}"
-        return f"vless://{cred}@{srv_ip}:{port}?{q}#{shortname}"
+        params = ["encryption=none"]
+        if flow:
+            params.append(f"flow={flow}")
+        if ep["is_tls"]:
+            params.append("security=tls")
+            if sni:
+                params.append(f"sni={sni}")
+            params.append("fp=firefox")
+        if net_type == "ws":
+            params.append("type=ws")
+            if sni:
+                params.append(f"host={sni}")
+            if ws_path:
+                params.append(f"path={urllib.parse.quote(ws_path, safe='')}")
+        return f"vless://{cred}@{connect_host}:{ext_port}?{'&'.join(params)}#{shortname}"
     elif proto == "trojan":
-        return f"trojan://{cred}@{srv_ip}:{port}?security=tls{f'&sni={sni}' if sni else ''}#{shortname}"
-    return f"{proto}://{cred}@{srv_ip}:{port}#{shortname}"
+        params = ["security=tls"]
+        if sni:
+            params.append(f"sni={sni}")
+        params.append("fp=firefox")
+        if net_type == "ws":
+            params.append("type=ws")
+            if sni:
+                params.append(f"host={sni}")
+            if ws_path:
+                params.append(f"path={urllib.parse.quote(ws_path, safe='')}")
+        return f"trojan://{cred}@{connect_host}:{ext_port}?{'&'.join(params)}#{shortname}"
+    return f"{proto}://{cred}@{connect_host}:{ext_port}#{shortname}"
 
 
 def discover_and_get_default_protocols():
@@ -604,15 +816,12 @@ def discover_and_get_default_protocols():
         if not inbounds or not isinstance(inbounds[0], dict):
             continue
         ib = inbounds[0]
-        port = int(ib.get("listen_port") or 0)
-        if not port:
-            m = re.search(r"-(\d+)$", shortname)
-            if m:
-                port = int(m.group(1))
-
         users = ib.get("users") or []
         first_user = users[0] if (users and isinstance(users[0], dict)) else {}
         proto, cred_type, tag = normalize_protocol_info(ib.get("type"), shortname, first_user)
+
+        ep = resolve_inbound_endpoint(shortname, ib, srv_ip)
+        port = int(ep["ext_port"] or ib.get("listen_port") or 0)
 
         saved = admin_accounts.get(fname) or {}
         admin_cred = saved.get("credential")
@@ -637,46 +846,58 @@ def discover_and_get_default_protocols():
                     k: v for k, v in first_user.items() if k not in ("name", "uuid", "password")
                 }
 
-        default_url = saved.get("default_url") or ""
-        if not default_url:
-            orig_users = ib.get("users")
-            need_temp_single = isinstance(orig_users, list) and len(orig_users) > 1
-            try:
-                if need_temp_single:
-                    single_admin = dict(extra_fields or {})
-                    single_admin[cred_type] = admin_cred
-                    ib["users"] = [single_admin]
-                    save_json_file(fpath, conf)
+        # 对 VMess (尤其是自定义修改了 path / max_early_data 且移除了 headers.host 的 VMess-WS-TLS)，
+        # 直接根据当前配置文件与 Caddy 反代配置实时生成带 fp=firefox 的标准 vmess:// 链接，不依赖 233boy sb url
+        if proto == "vmess":
+            default_url = build_vmess_base64_url(admin_cred, shortname, ib, srv_ip, ep=ep)
+        else:
+            default_url = saved.get("default_url") or ""
+            # 若是 Caddy 反代节点且旧缓存链接误用了内部端口(如 63708)，强制重新生成
+            if default_url and ep["is_caddy_tls"] and ep["listen_port"] and f":{ep['listen_port']}" in default_url:
+                default_url = ""
+            if not default_url:
+                orig_users = ib.get("users")
+                need_temp_single = isinstance(orig_users, list) and len(orig_users) > 1
+                try:
+                    if need_temp_single:
+                        single_admin = dict(extra_fields or {})
+                        single_admin[cred_type] = admin_cred
+                        ib["users"] = [single_admin]
+                        save_json_file(fpath, conf)
 
-                for cmd_args in (["url", shortname], ["url", str(port)], ["info", shortname]):
-                    out = run_sb_cmd(cmd_args, idx=idx, timeout_sec=5)
-                    default_url = extract_proxy_url(out)
-                    if default_url:
-                        break
-            finally:
-                if need_temp_single:
-                    ib["users"] = orig_users
-                    save_json_file(fpath, conf)
+                    for cmd_args in (["url", shortname], ["url", str(ep["listen_port"] or port)], ["info", shortname]):
+                        out = run_sb_cmd(cmd_args, idx=idx, timeout_sec=5)
+                        default_url = extract_proxy_url(out)
+                        if default_url:
+                            break
+                finally:
+                    if need_temp_single:
+                        ib["users"] = orig_users
+                        save_json_file(fpath, conf)
 
-        if not default_url:
-            default_url = saved.get("default_url") or build_fallback_url(proto, port, admin_cred, shortname, ib, srv_ip)
+            if not default_url:
+                default_url = build_fallback_url(proto, port, admin_cred, shortname, ib, srv_ip)
 
-        if admin_cred and proto != "vmess":
-            default_url = re.sub(r"^([a-zA-Z0-9]+://)[^@]+@", rf"\g<1>{admin_cred}@", default_url)
+            if admin_cred:
+                default_url = re.sub(r"^([a-zA-Z0-9]+://)[^@]+@", rf"\g<1>{admin_cred}@", default_url)
 
-        if admin_accounts.get(fname, {}).get("default_url") != default_url:
+        if admin_accounts.get(fname, {}).get("default_url") != default_url or admin_accounts.get(fname, {}).get("port") != port:
             admin_accounts.setdefault(fname, {})["default_url"] = default_url
+            admin_accounts.setdefault(fname, {})["port"] = port
             admin_changed = True
 
         default_links.append(default_url)
-        protocols_list.append({
+        proto_item = {
             "protocol": proto,
             "port": port,
             "tag": tag,
             "cred_type": cred_type,
             "default_url": default_url,
             "config_name": fname,
-        })
+        }
+        if proto == "vmess":
+            proto_item["decoded_summary"] = decode_vmess_url_summary(default_url)
+        protocols_list.append(proto_item)
 
     if admin_changed:
         save_json_file(ADMIN_ACCOUNTS_FILE, admin_accounts)
@@ -904,13 +1125,14 @@ def sync_users_to_singbox(payload_data, cfg=None, async_reload=False):
             if not inbounds or not isinstance(inbounds[0], dict):
                 continue
             ib = inbounds[0]
-            port = int(ib.get("listen_port") or 0)
+            listen_port = int(ib.get("listen_port") or 0)
             users_orig = ib.get("users") or []
             first_u = users_orig[0] if (users_orig and isinstance(users_orig[0], dict)) else {}
             proto, detected_cred_type, _ = normalize_protocol_info(ib.get("type"), shortname, first_u)
 
             cred_type = (
-                proto_cred_map.get(f"{proto}:{port}")
+                proto_cred_map.get(f"{proto}:{listen_port}")
+                or proto_cred_map.get(f"{proto}:443")
                 or proto_cred_map.get(proto)
                 or detected_cred_type
             )
@@ -1435,8 +1657,6 @@ class ClashRateLimiter:
             src_ip = src_ip[1:-1]
         if src_ip.startswith("::ffff:"):
             src_ip = src_ip[7:]
-        if not src_ip or src_ip in ("127.0.0.1", "::1", "0.0.0.0"):
-            return "", ""
 
         user = str(meta.get("user") or meta.get("authUser") or meta.get("inboundUser") or "").strip()
         if not user:
@@ -1444,6 +1664,9 @@ class ClashRateLimiter:
             m = AUTH_USER_RULE_RE.search(rule_str)
             if m:
                 user = m.group(1).strip()
+
+        if not src_ip or src_ip in ("127.0.0.1", "::1", "0.0.0.0"):
+            return user, ""
         return user, src_ip
 
     def poll_once(self):
@@ -1538,12 +1761,13 @@ class ClashRateLimiter:
                 if not isinstance(c, dict):
                     continue
                 user, src_ip = self.extract_user_and_ip(c)
-                if not user or not src_ip:
+                if not user:
                     continue
                 identified_conns += 1
                 if user == "admin" and not limit_admin:
                     continue
-                self.user_ip_last_seen.setdefault(user, {})[src_ip] = now
+                if src_ip:
+                    self.user_ip_last_seen.setdefault(user, {})[src_ip] = now
                 cid_key = str(c.get("id") or "")
                 if cid_key:
                     total = int(c.get("upload") or 0) + int(c.get("download") or 0)
@@ -2434,7 +2658,7 @@ show_status_table() {
     if (( proto_count == 0 )); then
         echo -e "${YELLOW}未检测到任何 sing-box 节点配置，请先运行 sb add 添加节点。${NC}"
     else
-        echo "${disc_json}" | jq -r '.protocols[] | "  • [\(.tag)] 配置文件: \(.config_name) | 端口: \(.port) | 凭据类型: \(.cred_type)\n    默认链接: \(.default_url)"'
+        echo "${disc_json}" | jq -r '.protocols[] | "  • [\(.tag)] 配置文件: \(.config_name) | 外部端口: \(.port) | 凭据类型: \(.cred_type)\n    默认链接: \(.default_url)" + (if (.decoded_summary // "") != "" then "\n    解析详情: " + .decoded_summary else "" end)'
     fi
 
     echo -e "\n${BOLD}${CYAN}================ 当前在席合租用户列表 (面板同步) ================${NC}"
@@ -2841,14 +3065,14 @@ __EOF_SB_ROTATOR_CORE__
 main() {
     check_root
     echo -e "\n${BOLD}${CYAN}=================================================================${NC}"
-    echo -e "${BOLD}   233boy/sing-box 面板动态同步 & Clash API 多IP/动态限速脚本 v3.1.2${NC}"
+    echo -e "${BOLD}   233boy/sing-box 面板动态同步 & Clash API 多IP/动态限速脚本 v3.1.3${NC}"
     echo -e "${BOLD}${CYAN}=================================================================${NC}"
 
     if [[ -x "${INSTALL_BIN}" && -f "${INSTALL_DIR}/config.env" && "${1:-}" == "" ]]; then
         echo -e "${GREEN}检测到本机已安装旧版或现有版本，请选择操作：${NC}"
-        echo -e "  ${GREEN}1)${NC} 升级核心与守护进程至 v3.1.2 并打开管理面板 (保留现有配置)"
-        echo -e "  ${GREEN}2)${NC} 升级核心与守护进程至 v3.1.2 并立即上报协议同步用户 (--register)"
-        echo -e "  ${GREEN}3)${NC} 升级/重装至 v3.1.2 并重新运行配置向导 (--config)"
+        echo -e "  ${GREEN}1)${NC} 升级核心与守护进程至 v3.1.3 并打开管理面板 (保留现有配置)"
+        echo -e "  ${GREEN}2)${NC} 升级核心与守护进程至 v3.1.3 并立即上报协议同步用户 (--register)"
+        echo -e "  ${GREEN}3)${NC} 升级/重装至 v3.1.3 并重新运行配置向导 (--config)"
         echo -e "  ${RED}4)${NC} 一键卸载"
         echo -e "  ${GREEN}0)${NC} 退出"
         local exist_opt=""
@@ -2875,7 +3099,7 @@ main() {
 
     check_dependencies
     deploy_core_script
-    echo -e "${GREEN}[成功] 核心程序 v3.1.2 已安装至 ${INSTALL_BIN} (快捷命令: sbr)${NC}"
+    echo -e "${GREEN}[成功] 核心程序 v3.1.3 已安装至 ${INSTALL_BIN} (快捷命令: sbr)${NC}"
 
     "${INSTALL_BIN}" --config
 
@@ -2887,7 +3111,7 @@ main() {
     fi
 
     echo -e "\n${BOLD}${GREEN}=================================================================${NC}"
-    echo -e "${BOLD}${GREEN} 🎉 v3.1.2 部署完成！随时输入 ${YELLOW}sbr${GREEN} 即可修改限速参数与查看限速生效状态${NC}"
+    echo -e "${BOLD}${GREEN} 🎉 v3.1.3 部署完成！随时输入 ${YELLOW}sbr${GREEN} 即可修改限速参数与查看限速生效状态${NC}"
     echo -e "${BOLD}${GREEN}=================================================================${NC}"
 }
 
