@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# install.sh - 233boy/sing-box 面板动态合租同步 & Clash API 多IP/动态流量共享限速 一键安装脚本 (v3.1.3)
+# install.sh - 233boy/sing-box 面板动态合租同步 & Clash API 多IP/动态流量共享限速 一键安装脚本 (v3.1.4)
 # 使用方式:
 #   bash <(curl -fsSL https://raw.githubusercontent.com/cpb66666/zidonghuanmi/main/install.sh)
 # ==============================================================================
@@ -70,7 +70,7 @@ deploy_core_script() {
     cat > "${INSTALL_BIN}" <<'__EOF_SB_ROTATOR_CORE__'
 #!/usr/bin/env bash
 # ==============================================================================
-# sb-rotator.sh - 233boy/sing-box 面板动态合租同步 & Clash API 多IP/动态流量限速系统 (v3.1.3)
+# sb-rotator.sh - 233boy/sing-box 面板动态合租同步 & Clash API 多IP/动态流量限速系统 (v3.1.4)
 # 核心能力:
 #   1. 自动扫描 /etc/sing-box/conf/*.json，提取管理员默认链接并通过 POST /api/v1/server/register 上报注册
 #   2. 同步响应 & Push 回调监听 (POST /api/v1/sync): 按协议 cred_type (uuid/password) 动态注入/移除合租用户，保留管理员默认账号
@@ -84,7 +84,7 @@ deploy_core_script() {
 set -o pipefail
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-VERSION="3.1.3"
+VERSION="3.1.4"
 INSTALL_DIR="${INSTALL_DIR:-/etc/sb-rotator}"
 CONFIG_FILE="${CONFIG_FILE:-${INSTALL_DIR}/config.env}"
 ADMIN_ACCOUNTS_FILE="${ADMIN_ACCOUNTS_FILE:-${INSTALL_DIR}/admin_accounts.json}"
@@ -231,7 +231,7 @@ load_config() {
 save_config() {
     ensure_dirs
     cat > "${CONFIG_FILE}" <<EOF
-# sb-rotator v3.1.3 配置文件 (面板同步 + Clash API 多IP与动态流量限速)
+# sb-rotator v3.1.4 配置文件 (面板同步 + Clash API 多IP与动态流量限速)
 PANEL_URL="${PANEL_URL}"
 API_KEY="${API_KEY}"
 SERVER_ID="${SERVER_ID:-1}"
@@ -301,7 +301,7 @@ write_python_daemon() {
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-sb_agent_daemon.py - 233boy/sing-box 节点注册、Push 同步回调与 Clash API 多IP/动态流量限速守护进程 (v3.1.3)
+sb_agent_daemon.py - 233boy/sing-box 节点注册、Push 同步回调与 Clash API 多IP/动态流量限速守护进程 (v3.1.4)
 """
 
 import os
@@ -333,7 +333,7 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
         self.server_name = "sb-agent"
         self.server_port = self.server_address[1]
 
-DAEMON_VERSION = "3.1.3"
+DAEMON_VERSION = "3.1.4"
 INSTALL_DIR = os.environ.get("INSTALL_DIR", "/etc/sb-rotator")
 CONFIG_FILE = os.environ.get("CONFIG_FILE", os.path.join(INSTALL_DIR, "config.env"))
 ADMIN_ACCOUNTS_FILE = os.environ.get("ADMIN_ACCOUNTS_FILE", os.path.join(INSTALL_DIR, "admin_accounts.json"))
@@ -670,6 +670,12 @@ def resolve_inbound_endpoint(shortname, inbound, srv_ip):
     if is_caddy_tls and (not ext_port or ext_port == listen_port):
         ext_port = 443
     final_path = ws_path or caddy_info["path"] or ("/" if net_type == "ws" else "")
+    max_early_data = int(transport.get("max_early_data") or 0)
+    early_data_header_name = str(transport.get("early_data_header_name") or "")
+    if net_type == "ws" and max_early_data > 0 and final_path and not re.search(r"[?&]ed=\d+", final_path):
+        sep = "&" if "?" in final_path else "?"
+        final_path = f"{final_path}{sep}ed={max_early_data}"
+
     is_tls = is_caddy_tls or tls_enabled
 
     return {
@@ -681,8 +687,8 @@ def resolve_inbound_endpoint(shortname, inbound, srv_ip):
         "path": final_path,
         "is_tls": is_tls,
         "is_caddy_tls": is_caddy_tls,
-        "max_early_data": int(transport.get("max_early_data") or 0),
-        "early_data_header_name": str(transport.get("early_data_header_name") or ""),
+        "max_early_data": max_early_data,
+        "early_data_header_name": early_data_header_name,
     }
 
 
@@ -3065,14 +3071,14 @@ __EOF_SB_ROTATOR_CORE__
 main() {
     check_root
     echo -e "\n${BOLD}${CYAN}=================================================================${NC}"
-    echo -e "${BOLD}   233boy/sing-box 面板动态同步 & Clash API 多IP/动态限速脚本 v3.1.3${NC}"
+    echo -e "${BOLD}   233boy/sing-box 面板动态同步 & Clash API 多IP/动态限速脚本 v3.1.4${NC}"
     echo -e "${BOLD}${CYAN}=================================================================${NC}"
 
     if [[ -x "${INSTALL_BIN}" && -f "${INSTALL_DIR}/config.env" && "${1:-}" == "" ]]; then
         echo -e "${GREEN}检测到本机已安装旧版或现有版本，请选择操作：${NC}"
-        echo -e "  ${GREEN}1)${NC} 升级核心与守护进程至 v3.1.3 并打开管理面板 (保留现有配置)"
-        echo -e "  ${GREEN}2)${NC} 升级核心与守护进程至 v3.1.3 并立即上报协议同步用户 (--register)"
-        echo -e "  ${GREEN}3)${NC} 升级/重装至 v3.1.3 并重新运行配置向导 (--config)"
+        echo -e "  ${GREEN}1)${NC} 升级核心与守护进程至 v3.1.4 并打开管理面板 (保留现有配置)"
+        echo -e "  ${GREEN}2)${NC} 升级核心与守护进程至 v3.1.4 并立即上报协议同步用户 (--register)"
+        echo -e "  ${GREEN}3)${NC} 升级/重装至 v3.1.4 并重新运行配置向导 (--config)"
         echo -e "  ${RED}4)${NC} 一键卸载"
         echo -e "  ${GREEN}0)${NC} 退出"
         local exist_opt=""
@@ -3099,7 +3105,7 @@ main() {
 
     check_dependencies
     deploy_core_script
-    echo -e "${GREEN}[成功] 核心程序 v3.1.3 已安装至 ${INSTALL_BIN} (快捷命令: sbr)${NC}"
+    echo -e "${GREEN}[成功] 核心程序 v3.1.4 已安装至 ${INSTALL_BIN} (快捷命令: sbr)${NC}"
 
     "${INSTALL_BIN}" --config
 
@@ -3111,7 +3117,7 @@ main() {
     fi
 
     echo -e "\n${BOLD}${GREEN}=================================================================${NC}"
-    echo -e "${BOLD}${GREEN} 🎉 v3.1.3 部署完成！随时输入 ${YELLOW}sbr${GREEN} 即可修改限速参数与查看限速生效状态${NC}"
+    echo -e "${BOLD}${GREEN} 🎉 v3.1.4 部署完成！随时输入 ${YELLOW}sbr${GREEN} 即可修改限速参数与查看限速生效状态${NC}"
     echo -e "${BOLD}${GREEN}=================================================================${NC}"
 }
 
