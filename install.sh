@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# install.sh - 233boy/sing-box 面板动态合租同步 & Clash API 多IP/动态流量共享限速 一键安装脚本 (v3.1.1)
+# install.sh - 233boy/sing-box 面板动态合租同步 & Clash API 多IP/动态流量共享限速 一键安装脚本 (v3.1.2)
 # 使用方式:
 #   bash <(curl -fsSL https://raw.githubusercontent.com/cpb66666/zidonghuanmi/main/install.sh)
 # ==============================================================================
@@ -70,7 +70,7 @@ deploy_core_script() {
     cat > "${INSTALL_BIN}" <<'__EOF_SB_ROTATOR_CORE__'
 #!/usr/bin/env bash
 # ==============================================================================
-# sb-rotator.sh - 233boy/sing-box 面板动态合租同步 & Clash API 多IP/动态流量限速系统 (v3.1.1)
+# sb-rotator.sh - 233boy/sing-box 面板动态合租同步 & Clash API 多IP/动态流量限速系统 (v3.1.2)
 # 核心能力:
 #   1. 自动扫描 /etc/sing-box/conf/*.json，提取管理员默认链接并通过 POST /api/v1/server/register 上报注册
 #   2. 同步响应 & Push 回调监听 (POST /api/v1/sync): 按协议 cred_type (uuid/password) 动态注入/移除合租用户，保留管理员默认账号
@@ -84,7 +84,7 @@ deploy_core_script() {
 set -o pipefail
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-VERSION="3.1.1"
+VERSION="3.1.2"
 INSTALL_DIR="${INSTALL_DIR:-/etc/sb-rotator}"
 CONFIG_FILE="${CONFIG_FILE:-${INSTALL_DIR}/config.env}"
 ADMIN_ACCOUNTS_FILE="${ADMIN_ACCOUNTS_FILE:-${INSTALL_DIR}/admin_accounts.json}"
@@ -231,7 +231,7 @@ load_config() {
 save_config() {
     ensure_dirs
     cat > "${CONFIG_FILE}" <<EOF
-# sb-rotator v3.1.1 配置文件 (面板同步 + Clash API 多IP与动态流量限速)
+# sb-rotator v3.1.2 配置文件 (面板同步 + Clash API 多IP与动态流量限速)
 PANEL_URL="${PANEL_URL}"
 API_KEY="${API_KEY}"
 SERVER_ID="${SERVER_ID:-1}"
@@ -301,7 +301,7 @@ write_python_daemon() {
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-sb_agent_daemon.py - 233boy/sing-box 节点注册、Push 同步回调与 Clash API 多IP/动态流量限速守护进程 (v3.1.1)
+sb_agent_daemon.py - 233boy/sing-box 节点注册、Push 同步回调与 Clash API 多IP/动态流量限速守护进程 (v3.1.2)
 """
 
 import os
@@ -319,9 +319,20 @@ import subprocess
 import urllib.request
 import urllib.error
 import urllib.parse
+import socketserver
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-DAEMON_VERSION = "3.1.1"
+
+class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = "sb-agent"
+        self.server_port = self.server_address[1]
+
+DAEMON_VERSION = "3.1.2"
 INSTALL_DIR = os.environ.get("INSTALL_DIR", "/etc/sb-rotator")
 CONFIG_FILE = os.environ.get("CONFIG_FILE", os.path.join(INSTALL_DIR, "config.env"))
 ADMIN_ACCOUNTS_FILE = os.environ.get("ADMIN_ACCOUNTS_FILE", os.path.join(INSTALL_DIR, "admin_accounts.json"))
@@ -626,25 +637,26 @@ def discover_and_get_default_protocols():
                     k: v for k, v in first_user.items() if k not in ("name", "uuid", "password")
                 }
 
-        default_url = ""
-        orig_users = ib.get("users")
-        need_temp_single = isinstance(orig_users, list) and len(orig_users) > 1
-        try:
-            if need_temp_single:
-                single_admin = dict(extra_fields or {})
-                single_admin[cred_type] = admin_cred
-                ib["users"] = [single_admin]
-                save_json_file(fpath, conf)
+        default_url = saved.get("default_url") or ""
+        if not default_url:
+            orig_users = ib.get("users")
+            need_temp_single = isinstance(orig_users, list) and len(orig_users) > 1
+            try:
+                if need_temp_single:
+                    single_admin = dict(extra_fields or {})
+                    single_admin[cred_type] = admin_cred
+                    ib["users"] = [single_admin]
+                    save_json_file(fpath, conf)
 
-            for cmd_args in (["url", shortname], ["url", str(port)], ["info", shortname]):
-                out = run_sb_cmd(cmd_args, idx=idx, timeout_sec=6)
-                default_url = extract_proxy_url(out)
-                if default_url:
-                    break
-        finally:
-            if need_temp_single:
-                ib["users"] = orig_users
-                save_json_file(fpath, conf)
+                for cmd_args in (["url", shortname], ["url", str(port)], ["info", shortname]):
+                    out = run_sb_cmd(cmd_args, idx=idx, timeout_sec=5)
+                    default_url = extract_proxy_url(out)
+                    if default_url:
+                        break
+            finally:
+                if need_temp_single:
+                    ib["users"] = orig_users
+                    save_json_file(fpath, conf)
 
         if not default_url:
             default_url = saved.get("default_url") or build_fallback_url(proto, port, admin_cred, shortname, ib, srv_ip)
@@ -743,24 +755,85 @@ def ensure_clash_api_and_user_routes(active_emails, cfg):
     return False
 
 
+RELOAD_LOCK = threading.Lock()
+RELOAD_PENDING = False
+
+
 def reload_singbox():
-    try:
-        if os.path.isdir("/run/systemd/system"):
-            subprocess.run(["systemctl", "restart", "sing-box"], timeout=15, check=False)
-            time.sleep(1)
-            res = subprocess.run(["systemctl", "is-active", "--quiet", "sing-box"], timeout=5)
-            if res.returncode != 0:
-                log("ERROR", "sing-box 服务重启后未处于 active 状态！")
-                return False
-            log("INFO", "sing-box 服务已平滑重启生效 (保留原 DNS 与 Clash API 配置)")
-            return True
-    except Exception as e:
-        log("ERROR", f"重启 sing-box 异常: {e}")
-    run_sb_cmd(["restart"], idx=1, timeout_sec=10)
-    return True
+    with RELOAD_LOCK:
+        try:
+            if os.path.isdir("/run/systemd/system"):
+                subprocess.run(["systemctl", "restart", "sing-box"], timeout=15, check=False)
+                time.sleep(0.5)
+                res = subprocess.run(["systemctl", "is-active", "--quiet", "sing-box"], timeout=5)
+                if res.returncode != 0:
+                    log("ERROR", "sing-box 服务重启后未处于 active 状态！")
+                    return False
+                log("INFO", "sing-box 服务已平滑重启生效 (保留原 DNS 与 Clash API 配置)")
+                return True
+        except Exception as e:
+            log("ERROR", f"重启 sing-box 异常: {e}")
+        run_sb_cmd(["restart"], idx=1, timeout_sec=10)
+        return True
 
 
-def sync_users_to_singbox(payload_data, cfg=None):
+def schedule_singbox_reload():
+    def _worker():
+        try:
+            reload_singbox()
+        except Exception as e:
+            log("ERROR", f"异步重启 sing-box 失败: {e}")
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+
+
+def ensure_admin_accounts_fast():
+    """
+    纯内存/文件级毫秒级初始化管理员默认凭据 (不调用耗时的 sing-box url 子进程)，
+    供 /api/v1/sync Push 接口高速处理使用，避免阻塞面板 HTTP 请求导致超时。
+    """
+    if not os.path.isdir(SB_CONF_DIR):
+        return {}
+    files = sorted([f for f in os.listdir(SB_CONF_DIR) if f.endswith(".json")])
+    admin_accounts = load_json_file(ADMIN_ACCOUNTS_FILE, {})
+    changed = False
+    for fname in files:
+        saved = admin_accounts.get(fname)
+        if isinstance(saved, dict) and saved.get("credential"):
+            continue
+        fpath = os.path.join(SB_CONF_DIR, fname)
+        shortname = fname[:-5]
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                conf = json.load(f)
+        except Exception:
+            continue
+        inbounds = conf.get("inbounds") or []
+        if not inbounds or not isinstance(inbounds[0], dict):
+            continue
+        ib = inbounds[0]
+        port = int(ib.get("listen_port") or 0)
+        users = ib.get("users") or []
+        first_user = users[0] if (users and isinstance(users[0], dict)) else {}
+        proto, cred_type, _ = normalize_protocol_info(ib.get("type"), shortname, first_user)
+        admin_cred = first_user.get(cred_type) or first_user.get("uuid") or first_user.get("password") or ""
+        extra_fields = {k: v for k, v in first_user.items() if k not in ("name", "uuid", "password")}
+        admin_accounts[fname] = {
+            "protocol": proto,
+            "port": port,
+            "cred_type": cred_type,
+            "credential": admin_cred,
+            "extra": extra_fields,
+            "default_url": (saved or {}).get("default_url", ""),
+        }
+        changed = True
+    if changed:
+        save_json_file(ADMIN_ACCOUNTS_FILE, admin_accounts)
+    return admin_accounts
+
+
+def sync_users_to_singbox(payload_data, cfg=None, async_reload=False):
     with SYNC_LOCK:
         if cfg is None:
             cfg = load_env_config()
@@ -789,8 +862,7 @@ def sync_users_to_singbox(payload_data, cfg=None):
                         if p_name:
                             proto_cred_map[p_name] = c_type
 
-        discover_and_get_default_protocols()
-        admin_accounts = load_json_file(ADMIN_ACCOUNTS_FILE, {})
+        admin_accounts = ensure_admin_accounts_fast()
 
         now_ts = int(time.time())
         valid_users = []
@@ -881,12 +953,18 @@ def sync_users_to_singbox(payload_data, cfg=None):
                 any_conf_changed = True
 
         global_changed = ensure_clash_api_and_user_routes(active_emails, cfg)
+        need_reload = any_conf_changed or global_changed
+        user_cnt = len(valid_users)
+        proto_cnt = len(files)
 
-        if any_conf_changed or global_changed:
+    if need_reload:
+        if async_reload:
+            schedule_singbox_reload()
+        else:
             reload_singbox()
 
-        log("INFO", f"已完成节点用户同步：当前在席合租用户 {len(valid_users)} 人 (+ 管理员默认账号)")
-        return True, f"synced {len(valid_users)} users across {len(files)} protocols", len(valid_users)
+    log("INFO", f"已完成节点用户同步：当前在席合租用户 {user_cnt} 人 (+ 管理员默认账号)")
+    return True, f"synced {user_cnt} users across {proto_cnt} protocols", user_cnt
 
 
 def compute_hmac_sha256(secret, message):
@@ -1730,7 +1808,24 @@ def print_limit_status():
     else:
         print(f"  4. 内核 TC 限速引擎    : {GREEN}🟢 就绪待命{NC} (网卡 {iface} 正常，当前无超限用户，触发限速时自动挂载 HTB 队列)")
 
-    overall_ok = daemon_running and clash_info["api_reachable"] and tc_info["iface_exists"] and (ip_en or dyn_en)
+    push_port = int(cfg.get("AGENT_PORT") or 18080)
+    push_ok = False
+    push_ms = 0
+    try:
+        t_p0 = time.time()
+        with urllib.request.urlopen(f"http://127.0.0.1:{push_port}/health", timeout=2) as presp:
+            push_ok = (presp.getcode() == 200)
+            push_ms = int((time.time() - t_p0) * 1000)
+    except Exception:
+        pass
+    last_push_file = os.path.join(CACHE_DIR, "last_push_payload.json")
+    last_push_str = now_cst_str(os.path.getmtime(last_push_file)) if os.path.isfile(last_push_file) else "暂无记录"
+    if push_ok:
+        print(f"  5. 面板 Push 回调监听  : {GREEN}✅ 正常响应{NC} (0.0.0.0:{push_port} 多线程异步服务, 本地响应 {push_ms}ms | 最近收到推送: {last_push_str})")
+    else:
+        print(f"  5. 面板 Push 回调监听  : {RED}❌ 未响应{NC} (端口 {push_port} 未就绪，请在主菜单选择 6 重启后台守护服务)")
+
+    overall_ok = daemon_running and push_ok and clash_info["api_reachable"] and tc_info["iface_exists"] and (ip_en or dyn_en)
     if overall_ok:
         print(f"  >>> {BOLD}限速系统整体状态   : {GREEN}✅ 限速监控已正常生效{NC}")
     elif not (ip_en or dyn_en):
@@ -1946,6 +2041,8 @@ def run_tc_self_test():
 # ==============================================================================
 
 class PushWebhookHandler(BaseHTTPRequestHandler):
+    timeout = 10
+
     def log_message(self, format, *args):
         pass
 
@@ -1954,6 +2051,7 @@ class PushWebhookHandler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
 
@@ -2086,10 +2184,13 @@ class PushWebhookHandler(BaseHTTPRequestHandler):
         with open(os.path.join(CACHE_DIR, "last_push_payload.json"), "w", encoding="utf-8") as f:
             f.write(raw_body)
 
+        t0 = time.time()
         log("STEP", f"收到面板 Push 同步请求 (来源: {self.client_address[0]})")
-        ok, msg, count = sync_users_to_singbox(payload, cfg)
+        ok, msg, count = sync_users_to_singbox(payload, cfg, async_reload=True)
+        elapsed_ms = int((time.time() - t0) * 1000)
         if ok:
-            self._send_json(200, {"ok": True, "message": msg, "synced_users": count})
+            log("INFO", f"已响应面板 Push 同步请求 (耗时 {elapsed_ms}ms, 在席用户: {count} 人)")
+            self._send_json(200, {"ok": True, "message": msg, "synced_users": count, "elapsed_ms": elapsed_ms})
         else:
             self._send_json(500, {"ok": False, "message": msg})
 
@@ -2123,10 +2224,12 @@ def run_daemon():
         f"动态限速({cfg.get('DYN_LIMIT_ENABLE','true')}): {cfg.get('DYN_WINDOW_MIN','40')}m>={cfg.get('DYN_THRESHOLD_GB','2.5')}GB -> {cfg.get('DYN_LIMIT_MBPS','10')}Mbps({cfg.get('DYN_LIMIT_MIN','60')}m)"
     )
 
+    server = ThreadingHTTPServer(("0.0.0.0", port), PushWebhookHandler)
+
     if cfg.get("PANEL_URL") and cfg.get("API_KEY"):
         threading.Thread(target=register_with_panel, kwargs={"dry_run": False}, daemon=True).start()
     else:
-        discover_and_get_default_protocols()
+        threading.Thread(target=ensure_admin_accounts_fast, daemon=True).start()
         ensure_clash_api_and_user_routes([], cfg)
 
     def limiter_loop():
@@ -2144,8 +2247,6 @@ def run_daemon():
 
     t = threading.Thread(target=limiter_loop, daemon=True)
     t.start()
-
-    server = HTTPServer(("0.0.0.0", port), PushWebhookHandler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -2232,6 +2333,11 @@ open_firewall_port() {
         firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null 2>&1 || true
         firewall-cmd --reload >/dev/null 2>&1 || true
     fi
+    if command -v iptables >/dev/null 2>&1; then
+        if ! iptables -C INPUT -p tcp --dport "${port}" -j ACCEPT >/dev/null 2>&1; then
+            iptables -I INPUT -p tcp --dport "${port}" -j ACCEPT >/dev/null 2>&1 || true
+        fi
+    fi
 }
 
 is_daemon_running() {
@@ -2275,9 +2381,11 @@ RestartSec=3
 [Install]
 WantedBy=multi-user.target
 EOF
+        systemctl stop sb-agent.service >/dev/null 2>&1 || true
+        pkill -9 -f "${DAEMON_SCRIPT}" 2>/dev/null || true
         systemctl daemon-reload >/dev/null 2>&1 || true
         systemctl enable sb-agent.service >/dev/null 2>&1 || true
-        systemctl restart sb-agent.service >/dev/null 2>&1 || true
+        systemctl start sb-agent.service >/dev/null 2>&1 || true
         info "已部署并重启后台守护服务 sb-agent.service (v${VERSION}, Push 回调端口: ${AGENT_PORT:-18080})"
     else
         pkill -f "${DAEMON_SCRIPT}" 2>/dev/null || true
@@ -2733,14 +2841,14 @@ __EOF_SB_ROTATOR_CORE__
 main() {
     check_root
     echo -e "\n${BOLD}${CYAN}=================================================================${NC}"
-    echo -e "${BOLD}   233boy/sing-box 面板动态同步 & Clash API 多IP/动态限速脚本 v3.1.1${NC}"
+    echo -e "${BOLD}   233boy/sing-box 面板动态同步 & Clash API 多IP/动态限速脚本 v3.1.2${NC}"
     echo -e "${BOLD}${CYAN}=================================================================${NC}"
 
     if [[ -x "${INSTALL_BIN}" && -f "${INSTALL_DIR}/config.env" && "${1:-}" == "" ]]; then
         echo -e "${GREEN}检测到本机已安装旧版或现有版本，请选择操作：${NC}"
-        echo -e "  ${GREEN}1)${NC} 升级核心与守护进程至 v3.1.1 并打开管理面板 (保留现有配置)"
-        echo -e "  ${GREEN}2)${NC} 升级核心与守护进程至 v3.1.1 并立即上报协议同步用户 (--register)"
-        echo -e "  ${GREEN}3)${NC} 升级/重装至 v3.1.1 并重新运行配置向导 (--config)"
+        echo -e "  ${GREEN}1)${NC} 升级核心与守护进程至 v3.1.2 并打开管理面板 (保留现有配置)"
+        echo -e "  ${GREEN}2)${NC} 升级核心与守护进程至 v3.1.2 并立即上报协议同步用户 (--register)"
+        echo -e "  ${GREEN}3)${NC} 升级/重装至 v3.1.2 并重新运行配置向导 (--config)"
         echo -e "  ${RED}4)${NC} 一键卸载"
         echo -e "  ${GREEN}0)${NC} 退出"
         local exist_opt=""
@@ -2767,7 +2875,7 @@ main() {
 
     check_dependencies
     deploy_core_script
-    echo -e "${GREEN}[成功] 核心程序 v3.1.1 已安装至 ${INSTALL_BIN} (快捷命令: sbr)${NC}"
+    echo -e "${GREEN}[成功] 核心程序 v3.1.2 已安装至 ${INSTALL_BIN} (快捷命令: sbr)${NC}"
 
     "${INSTALL_BIN}" --config
 
@@ -2779,7 +2887,7 @@ main() {
     fi
 
     echo -e "\n${BOLD}${GREEN}=================================================================${NC}"
-    echo -e "${BOLD}${GREEN} 🎉 v3.1.1 部署完成！随时输入 ${YELLOW}sbr${GREEN} 即可修改限速参数与查看限速生效状态${NC}"
+    echo -e "${BOLD}${GREEN} 🎉 v3.1.2 部署完成！随时输入 ${YELLOW}sbr${GREEN} 即可修改限速参数与查看限速生效状态${NC}"
     echo -e "${BOLD}${GREEN}=================================================================${NC}"
 }
 
