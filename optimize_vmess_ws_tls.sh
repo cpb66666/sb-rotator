@@ -1,14 +1,12 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Sing-box (233boy) 代理协议 (VMess-WS-TLS / VLESS-REALITY) & Caddy 一键伪装优化脚本
-# 功能：
-#   1. 交互式菜单选择：
-#      - [1] 一键优化 VMess-WS-TLS 协议 + Caddy 反代 + 随机行业静态网站
-#      - [2] 一键修改 VLESS-REALITY 协议 (偷自己域名 Self-Steal) + Caddy 自动申请证书与静态站
-#      - [3] 仅随机更换 / 手动选择 /var/www/html 静态伪装网站模板
-#   2. 自动检测并安装缺失的依赖 (jq / Caddy) 及初始化 /etc/caddy/Caddyfile 与 /etc/caddy/233boy 目录
-#   3. 内置 5 套不同行业的精美响应式 HTML 静态网站模板
-#   4. 自动备份原始配置并校验、重启 sing-box 与 caddy 服务
+# 功能菜单：
+#   [1] 一键优化 VMess-WS-TLS 协议 (自动提取域名/端口 + Caddy 防探测反代 + 随机静态网站)
+#   [2] 一键修改 VLESS-REALITY (自偷模式：本机部署 Caddy 静态站 + 自动签发证书 + 偷本机域名)
+#   [3] 一键修改 VLESS-REALITY (偷相邻/指定外部域名：无需本机建站，直接修改 SNI 与握手目标)
+#   [4] 一键独立部署 Caddy + 静态伪装网站 (输入域名自动建站，可供本机或相邻机器 REALITY 借用)
+#   [5] 仅更换 /var/www/html 静态伪装网站模板 (内置 5 套跨行业响应式站点，支持随机或指定)
 # ==============================================================================
 
 set -euo pipefail
@@ -75,8 +73,10 @@ ensure_parser() {
 }
 
 ensure_caddy() {
-    local mode="${1:-vmess}"       # vmess 或 reality
+    local mode="${1:-vmess}"       # vmess / standalone 或 reality
     local https_port="${2:-8443}"  # 当 mode=reality 且全新初始化 Caddyfile 时使用的 https_port
+
+    mkdir -p "$BACKUP_DIR/caddy" "$CADDY_CONF_DIR" "$WEB_ROOT"
 
     if ! command -v caddy >/dev/null 2>&1; then
         log_warn "未检测到 Caddy，正在为您自动安装 Caddy..."
@@ -108,8 +108,6 @@ ensure_caddy() {
         systemctl enable caddy >/dev/null 2>&1 || true
         log_ok "Caddy 安装完成"
     fi
-
-    mkdir -p "$CADDY_CONF_DIR" "$WEB_ROOT"
 
     # 确保 /etc/caddy/Caddyfile 存在且包含 import /etc/caddy/233boy/*.conf
     if [[ ! -f "$CADDY_MAIN_CONF" ]]; then
@@ -495,11 +493,9 @@ EOF
 }
 
 # ==============================================================================
-# 重启并校验 Sing-box 与 Caddy 服务
+# 重启服务辅助函数
 # ==============================================================================
-restart_services() {
-    log_info "正在校验并重启 Sing-box 与 Caddy 服务..."
-
+restart_singbox() {
     if command -v sing-box >/dev/null 2>&1; then
         if sing-box check -c /etc/sing-box/config.json -C "$SINGBOX_CONF_DIR" >/dev/null 2>&1; then
             log_ok "Sing-box 配置语法校验通过"
@@ -514,12 +510,90 @@ restart_services() {
     else
         log_warn "未检测到 systemd 中的 sing-box 服务，请手动重启 sing-box"
     fi
+}
 
+restart_caddy() {
     if systemctl is-active --quiet caddy || systemctl list-unit-files | grep -q "^caddy\.service"; then
         systemctl reload caddy 2>/dev/null || systemctl restart caddy
         log_ok "caddy 服务已重载/重启"
     else
         log_warn "未检测到 systemd 中的 caddy 服务，请手动重启 caddy"
+    fi
+}
+
+restart_services() {
+    log_info "正在校验并重启 Sing-box 与 Caddy 服务..."
+    restart_singbox
+    restart_caddy
+}
+
+# ==============================================================================
+# 扫描并选择 VLESS-REALITY 配置文件公共函数
+# ==============================================================================
+select_reality_files() {
+    shopt -s nullglob
+    local candidate_files=("$SINGBOX_CONF_DIR"/VLESS-REALITY-*.json "$SINGBOX_CONF_DIR"/*reality*.json "$SINGBOX_CONF_DIR"/*.json)
+    shopt -u nullglob
+
+    declare -A seen_files
+    REALITY_TARGET_FILES=()
+    local reality_files=()
+
+    for f in "${candidate_files[@]}"; do
+        if [[ -f "$f" && -z "${seen_files[$f]:-}" ]]; then
+            seen_files["$f"]=1
+            local is_reality=""
+            if [[ "$PARSER" == "jq" ]]; then
+                is_reality=$(jq -r 'if (.inbounds[0].type == "vless" and .inbounds[0].tls.reality.enabled == true) then "yes" else "no" end' "$f" 2>/dev/null || echo "no")
+            else
+                is_reality=$(python3 - "$f" << 'PYEOF'
+import json, sys
+try:
+    with open(sys.argv[1], 'r', encoding='utf-8') as fp:
+        d = json.load(fp)
+    ib = (d.get('inbounds') or [{}])[0]
+    if ib.get('type') == 'vless' and ((ib.get('tls') or {}).get('reality') or {}).get('enabled') is True:
+        print("yes")
+    else:
+        print("no")
+except Exception:
+    print("no")
+PYEOF
+)
+            fi
+            if [[ "$is_reality" == "yes" ]]; then
+                reality_files+=("$f")
+            fi
+        fi
+    done
+
+    if [[ ${#reality_files[@]} -eq 0 ]]; then
+        log_err "在 $SINGBOX_CONF_DIR 中未找到任何启用了 REALITY 的 VLESS 配置文件！"
+        return 1
+    fi
+
+    if [[ ${#reality_files[@]} -eq 1 ]]; then
+        REALITY_TARGET_FILES=("${reality_files[0]}")
+        log_info "自动识别到 VLESS-REALITY 配置文件: ${REALITY_TARGET_FILES[0]}"
+    else
+        echo ""
+        echo -e "${CYAN}检测到多个 VLESS-REALITY 配置文件：${NC}"
+        local idx=1
+        for rf in "${reality_files[@]}"; do
+            echo -e "  [${GREEN}${idx}${NC}] $(basename "$rf")"
+            idx=$((idx + 1))
+        done
+        echo -e "  [${GREEN}0${NC}] 全部修改"
+        read -r -p "请选择要修改的配置文件序号 [默认 1]: " file_choice
+        file_choice="${file_choice:-1}"
+        if [[ "$file_choice" == "0" ]]; then
+            REALITY_TARGET_FILES=("${reality_files[@]}")
+        elif [[ "$file_choice" =~ ^[0-9]+$ ]] && (( file_choice >= 1 && file_choice <= ${#reality_files[@]} )); then
+            REALITY_TARGET_FILES=("${reality_files[$((file_choice - 1))]}")
+        else
+            log_err "无效的序号选择"
+            return 1
+        fi
     fi
 }
 
@@ -539,7 +613,6 @@ optimize_vmess_ws_tls() {
     echo ""
     read -r -p "请输入 WebSocket 伪装路径 [直接回车默认 ${DEFAULT_WS_PATH}]: " input_ws_path
     local target_ws_path="${input_ws_path:-$DEFAULT_WS_PATH}"
-    # 确保以 / 开头
     [[ "$target_ws_path" != /* ]] && target_ws_path="/$target_ws_path"
 
     shopt -s nullglob
@@ -600,7 +673,6 @@ PYEOF
             continue
         fi
 
-        # 若 headers.host 已被移除，尝试从文件名提取域名
         if [[ -z "$domain" ]]; then
             if [[ "$filename" =~ ^VMess-WS-TLS-(.+)\.json$ ]]; then
                 domain="${BASH_REMATCH[1]}"
@@ -609,7 +681,6 @@ PYEOF
             fi
         fi
 
-        # 若域名依旧不像有效域名，提示用户输入
         if [[ -z "$domain" || "$domain" != *.* ]]; then
             read -r -p "未能从 $filename 自动识别域名，请手动输入该节点的域名: " domain
         fi
@@ -619,10 +690,8 @@ PYEOF
             continue
         fi
 
-        # 备份原配置
         cp -a "$conf_file" "$BACKUP_DIR/sing-box/$filename"
 
-        # 修改 Sing-box 配置文件
         if [[ "$PARSER" == "jq" ]]; then
             local tmp_json
             tmp_json=$(mktemp)
@@ -654,7 +723,6 @@ PYEOF
         fi
         log_ok "已优化 Sing-box 配置: $conf_file (端口: $listen_port, 路径: $target_ws_path)"
 
-        # 生成对应 Caddy 配置
         local caddy_file="$CADDY_CONF_DIR/${domain}.conf"
         if [[ -f "$caddy_file" ]]; then
             cp -a "$caddy_file" "$BACKUP_DIR/caddy/${domain}.conf"
@@ -722,9 +790,9 @@ EOF
 }
 
 # ==============================================================================
-# 功能 2：修改 VLESS-REALITY 协议 (偷自己域名 Self-Steal) + Caddy 静态网站
+# 功能 2：修改 VLESS-REALITY (自偷模式：本机部署 Caddy 静态站 + 偷本机域名)
 # ==============================================================================
-optimize_vless_reality() {
+optimize_vless_reality_self() {
     if [[ ! -d "$SINGBOX_CONF_DIR" ]]; then
         log_err "未找到 Sing-box 配置目录: $SINGBOX_CONF_DIR"
         return 1
@@ -732,80 +800,13 @@ optimize_vless_reality() {
 
     ensure_parser
     mkdir -p "$BACKUP_DIR/sing-box" "$BACKUP_DIR/caddy"
+    select_reality_files
 
-    # 扫描所有 VLESS-REALITY 配置文件
-    shopt -s nullglob
-    local candidate_files=("$SINGBOX_CONF_DIR"/VLESS-REALITY-*.json "$SINGBOX_CONF_DIR"/*reality*.json "$SINGBOX_CONF_DIR"/*.json)
-    shopt -u nullglob
-
-    declare -A seen_files
-    local reality_files=()
-    for f in "${candidate_files[@]}"; do
-        if [[ -f "$f" && -z "${seen_files[$f]:-}" ]]; then
-            seen_files["$f"]=1
-            local is_reality=""
-            if [[ "$PARSER" == "jq" ]]; then
-                is_reality=$(jq -r 'if (.inbounds[0].type == "vless" and .inbounds[0].tls.reality.enabled == true) then "yes" else "no" end' "$f" 2>/dev/null || echo "no")
-            else
-                is_reality=$(python3 - "$f" << 'PYEOF'
-import json, sys
-try:
-    with open(sys.argv[1], 'r', encoding='utf-8') as fp:
-        d = json.load(fp)
-    ib = (d.get('inbounds') or [{}])[0]
-    if ib.get('type') == 'vless' and ((ib.get('tls') or {}).get('reality') or {}).get('enabled') is True:
-        print("yes")
-    else:
-        print("no")
-except Exception:
-    print("no")
-PYEOF
-)
-            fi
-            if [[ "$is_reality" == "yes" ]]; then
-                reality_files+=("$f")
-            fi
-        fi
-    done
-
-    if [[ ${#reality_files[@]} -eq 0 ]]; then
-        log_err "在 $SINGBOX_CONF_DIR 中未找到任何启用了 REALITY 的 VLESS 配置文件！"
-        return 1
-    fi
-
-    # 若存在多个 REALITY 配置文件，允许用户选择
-    local target_files=()
-    if [[ ${#reality_files[@]} -eq 1 ]]; then
-        target_files=("${reality_files[0]}")
-        log_info "自动识别到 VLESS-REALITY 配置文件: ${target_files[0]}"
-    else
-        echo ""
-        echo -e "${CYAN}检测到多个 VLESS-REALITY 配置文件：${NC}"
-        local idx=1
-        for rf in "${reality_files[@]}"; do
-            echo -e "  [${GREEN}${idx}${NC}] $(basename "$rf")"
-            idx=$((idx + 1))
-        done
-        echo -e "  [${GREEN}0${NC}] 全部修改"
-        read -r -p "请选择要修改的配置文件序号 [默认 1]: " file_choice
-        file_choice="${file_choice:-1}"
-        if [[ "$file_choice" == "0" ]]; then
-            target_files=("${reality_files[@]}")
-        elif [[ "$file_choice" =~ ^[0-9]+$ ]] && (( file_choice >= 1 && file_choice <= ${#reality_files[@]} )); then
-            target_files=("${reality_files[$((file_choice - 1))]}")
-        else
-            log_err "无效的序号选择"
-            return 1
-        fi
-    fi
-
-    # 交互式输入自建域名 (必填)
     echo ""
     local self_domain=""
     while [[ -z "$self_domain" ]]; do
         read -r -p "请输入已解析到本机的域名 (用于搭建静态网站与 REALITY SNI，如 node1.example.com): " self_domain
         self_domain=$(echo "$self_domain" | tr -d '[:space:]')
-        # 去除可能误输入的 http:// 或 https:// 及尾部斜杠
         self_domain="${self_domain#http://}"
         self_domain="${self_domain#https://}"
         self_domain="${self_domain%%/*}"
@@ -815,16 +816,14 @@ PYEOF
         fi
     done
 
-    # 交互式输入 Caddy 本地回源 HTTPS 端口 (默认 8443)
     read -r -p "请输入 Caddy 本地 HTTPS 监听端口 (供 Sing-box REALITY 握手偷取证书) [默认 ${DEFAULT_REALITY_CADDY_PORT}]: " caddy_https_port
     caddy_https_port="${caddy_https_port:-$DEFAULT_REALITY_CADDY_PORT}"
 
-    # 确保 Caddy 已安装且配置目录就绪
     ensure_caddy "reality" "$caddy_https_port"
 
     local summary_list=()
 
-    for conf_file in "${target_files[@]}"; do
+    for conf_file in "${REALITY_TARGET_FILES[@]}"; do
         local filename
         filename=$(basename "$conf_file")
         cp -a "$conf_file" "$BACKUP_DIR/sing-box/$filename"
@@ -863,10 +862,6 @@ PYEOF
 )
         fi
 
-        # 修改 Sing-box VLESS-REALITY 配置：
-        # 1. tls.server_name -> $self_domain
-        # 2. tls.reality.handshake.server -> "127.0.0.1"
-        # 3. tls.reality.handshake.server_port -> $caddy_https_port (整数)
         if [[ "$PARSER" == "jq" ]]; then
             local tmp_json
             tmp_json=$(mktemp)
@@ -894,14 +889,10 @@ with open(path, 'w', encoding='utf-8') as f:
 PYEOF
         fi
 
-        log_ok "已更新 Sing-box REALITY 配置: $conf_file (原 SNI: ${old_sni} -> 新 SNI: ${self_domain}, 握手目标: 127.0.0.1:${caddy_https_port})"
-        summary_list+=("配置文件: ${filename} | 监听端口: ${listen_port} | 新 SNI (server_name): ${self_domain} | UUID: ${uuid} | PublicKey: ${pub_key:-未记录} | ShortID: ${short_id:-空}")
+        log_ok "已更新 Sing-box REALITY 配置: $conf_file (SNI: ${old_sni} -> ${self_domain}, 握手: 127.0.0.1:${caddy_https_port})"
+        summary_list+=("配置文件: ${filename} | 监听端口: ${listen_port} | 新 SNI: ${self_domain} | UUID: ${uuid} | PublicKey: ${pub_key:-未记录}")
     done
 
-    # 写入 /etc/caddy/233boy/<域名>.conf
-    # 说明：
-    # - 块 1: https://${self_domain}:${caddy_https_port} 仅绑定 127.0.0.1，供本地 Sing-box REALITY 握手回源并提供静态网页，不占用外部 443 端口
-    # - 块 2: http://${self_domain}:80 监听 80 端口，让 Caddy 自动通过 HTTP-01 验证申请/续期 Let's Encrypt 证书，并将普通 HTTP 访问 301 跳转至 https://${self_domain} (即 443 端口的 Sing-box REALITY，再由 Sing-box 透明回源到 Caddy 展示静态网站)
     local caddy_file="$CADDY_CONF_DIR/${self_domain}.conf"
     if [[ -f "$caddy_file" ]]; then
         cp -a "$caddy_file" "$BACKUP_DIR/caddy/${self_domain}.conf"
@@ -930,30 +921,221 @@ EOF
 
     echo ""
     echo -e "${GREEN}======================================================================${NC}"
-    echo -e "${GREEN} 🎉 VLESS-REALITY (自建域名伪装站 Self-Steal) 一键配置完成！${NC}"
+    echo -e "${GREEN} 🎉 VLESS-REALITY (本机自建域名伪装站 Self-Steal) 一键配置完成！${NC}"
     echo -e "${GREEN}======================================================================${NC}"
     echo -e "📦 原配置备份目录 : ${YELLOW}${BACKUP_DIR}${NC}"
     echo -e "🌐 伪装网站目录   : ${YELLOW}${WEB_ROOT}/index.html${NC} (${SITE_NAME})"
-    echo -e "📄 Caddy 配置文件 : ${YELLOW}${caddy_file}${NC} (本地回源端口: 127.0.0.1:${caddy_https_port})"
+    echo -e "📄 Caddy 配置文件 : ${YELLOW}${caddy_file}${NC} (本地回源: 127.0.0.1:${caddy_https_port})"
     echo -e "🔗 优化节点详情   :"
     for item in "${summary_list[@]}"; do
         echo -e "   - ${CYAN}${item}${NC}"
     done
     echo ""
     echo -e "${YELLOW}💡 客户端连接参数更新提示：${NC}"
-    echo -e "   1. 请将客户端中的 ${GREEN}SNI (Server Name / 伪装域名)${NC} 修改为: ${GREEN}${self_domain}${NC}"
-    echo -e "   2. 客户端连接地址 (Address) 可继续填服务器 IP 或直接填写 ${GREEN}${self_domain}${NC}"
-    echo -e "   3. UUID、PublicKey (公钥)、ShortID、端口 均保持不变！"
-    echo -e "   4. 现在直接在浏览器访问 ${GREEN}https://${self_domain}${NC} 即可看到真实 HTTPS 证书的静态伪装网站。"
+    echo -e "   1. 将客户端中的 ${GREEN}SNI (Server Name)${NC} 修改为: ${GREEN}${self_domain}${NC}"
+    echo -e "   2. 客户端连接地址 (Address) 可填服务器 IP 或直接填 ${GREEN}${self_domain}${NC}"
+    echo -e "   3. UUID、PublicKey、ShortID、端口 均保持不变！"
     echo -e "${GREEN}======================================================================${NC}"
 }
 
 # ==============================================================================
-# 功能 3：单独更换静态网站模板菜单
+# 功能 3：修改 VLESS-REALITY (偷相邻同机房/指定外部域名，本机无需建站)
+# ==============================================================================
+optimize_vless_reality_neighbor() {
+    if [[ ! -d "$SINGBOX_CONF_DIR" ]]; then
+        log_err "未找到 Sing-box 配置目录: $SINGBOX_CONF_DIR"
+        return 1
+    fi
+
+    ensure_parser
+    mkdir -p "$BACKUP_DIR/sing-box"
+    select_reality_files
+
+    echo ""
+    local target_sni=""
+    while [[ -z "$target_sni" ]]; do
+        read -r -p "请输入要借用的相邻节点域名或同机房目标域名 (SNI，如 us02.subscription.men): " target_sni
+        target_sni=$(echo "$target_sni" | tr -d '[:space:]')
+        target_sni="${target_sni#http://}"
+        target_sni="${target_sni#https://}"
+        target_sni="${target_sni%%/*}"
+        if [[ -z "$target_sni" || "$target_sni" != *.* ]]; then
+            log_warn "请输入合法的域名格式！"
+            target_sni=""
+        fi
+    done
+
+    read -r -p "请输入目标握手端口 [直接回车默认 443]: " target_port
+    target_port="${target_port:-443}"
+
+    local summary_list=()
+
+    for conf_file in "${REALITY_TARGET_FILES[@]}"; do
+        local filename
+        filename=$(basename "$conf_file")
+        cp -a "$conf_file" "$BACKUP_DIR/sing-box/$filename"
+
+        local listen_port="" uuid="" old_sni="" pub_key=""
+        if [[ "$PARSER" == "jq" ]]; then
+            listen_port=$(jq -r '.inbounds[0].listen_port // empty' "$conf_file")
+            uuid=$(jq -r '.inbounds[0].users[0].uuid // empty' "$conf_file")
+            old_sni=$(jq -r '.inbounds[0].tls.server_name // empty' "$conf_file")
+            pub_key=$(jq -r '.outbounds[]? | select(.tag != null and (.tag | startswith("public_key_"))) | .tag | sub("^public_key_"; "")' "$conf_file" | head -n1)
+        else
+            read -r listen_port uuid old_sni pub_key < <(python3 - "$conf_file" << 'PYEOF'
+import json, sys
+with open(sys.argv[1], 'r', encoding='utf-8') as f:
+    d = json.load(f)
+ib = (d.get('inbounds') or [{}])[0]
+tls = ib.get('tls') or {}
+usr = (ib.get('users') or [{}])[0]
+pub = ''
+for ob in (d.get('outbounds') or []):
+    t = ob.get('tag', '')
+    if t.startswith('public_key_'):
+        pub = t[len('public_key_'):]
+        break
+print(ib.get('listen_port', ''), usr.get('uuid', ''), tls.get('server_name', ''), pub)
+PYEOF
+)
+        fi
+
+        if [[ "$PARSER" == "jq" ]]; then
+            local tmp_json
+            tmp_json=$(mktemp)
+            jq --arg domain "$target_sni" --argjson hport "$target_port" '
+                .inbounds[0].tls.server_name = $domain |
+                .inbounds[0].tls.reality.handshake.server = $domain |
+                .inbounds[0].tls.reality.handshake.server_port = $hport
+            ' "$conf_file" > "$tmp_json" && mv "$tmp_json" "$conf_file"
+        else
+            python3 - "$conf_file" "$target_sni" "$target_port" << 'PYEOF'
+import json, sys
+path, domain, hport = sys.argv[1], sys.argv[2], int(sys.argv[3])
+with open(path, 'r', encoding='utf-8') as f:
+    data = json.load(f)
+if data.get('inbounds'):
+    tls = data['inbounds'][0].setdefault('tls', {})
+    tls['server_name'] = domain
+    reality = tls.setdefault('reality', {})
+    handshake = reality.setdefault('handshake', {})
+    handshake['server'] = domain
+    handshake['server_port'] = hport
+with open(path, 'w', encoding='utf-8') as f:
+    json.dump(data, f, indent=2, ensure_ascii=False)
+    f.write('\n')
+PYEOF
+        fi
+
+        log_ok "已更新 Sing-box REALITY 配置: $conf_file (原 SNI: ${old_sni} -> 新目标: ${target_sni}:${target_port})"
+        summary_list+=("配置文件: ${filename} | 监听端口: ${listen_port} | 伪装目标 (SNI): ${target_sni}:${target_port} | UUID: ${uuid} | PublicKey: ${pub_key:-未记录}")
+    done
+
+    restart_singbox
+
+    echo ""
+    echo -e "${GREEN}======================================================================${NC}"
+    echo -e "${GREEN} 🎉 VLESS-REALITY (借用相邻/指定域名伪装) 修改完成！${NC}"
+    echo -e "${GREEN}======================================================================${NC}"
+    echo -e "📦 原配置备份目录 : ${YELLOW}${BACKUP_DIR}${NC}"
+    echo -e "🔗 优化节点详情   :"
+    for item in "${summary_list[@]}"; do
+        echo -e "   - ${CYAN}${item}${NC}"
+    done
+    echo ""
+    echo -e "${YELLOW}💡 客户端连接参数更新提示：${NC}"
+    echo -e "   1. 客户端连接地址 (Address) 填本机 IP"
+    echo -e "   2. 客户端 ${GREEN}SNI (Server Name)${NC} 修改为: ${GREEN}${target_sni}${NC}"
+    echo -e "   3. UUID、PublicKey、ShortID、端口 均保持不变！"
+    echo -e "${GREEN}======================================================================${NC}"
+}
+
+# ==============================================================================
+# 功能 4：一键独立部署 Caddy + 静态伪装网站 (绑定域名自动开启 HTTPS)
+# ==============================================================================
+deploy_standalone_caddy_site() {
+    echo ""
+    local site_domain=""
+    while [[ -z "$site_domain" ]]; do
+        read -r -p "请输入要部署静态伪装网站的域名 (需已解析到本机 IP，如 web.example.com): " site_domain
+        site_domain=$(echo "$site_domain" | tr -d '[:space:]')
+        site_domain="${site_domain#http://}"
+        site_domain="${site_domain#https://}"
+        site_domain="${site_domain%%/*}"
+        if [[ -z "$site_domain" || "$site_domain" != *.* ]]; then
+            log_warn "请输入合法的域名格式！"
+            site_domain=""
+        fi
+    done
+
+    echo ""
+    echo -e "${CYAN}请选择 Caddy 监听模式：${NC}"
+    echo -e "  [${GREEN}1${NC}] 标准公网 HTTPS 模式 (监听公网 80/443，适合独立建站或供相邻机器 REALITY 偷取)"
+    echo -e "  [${GREEN}2${NC}] 本地回源 HTTPS 模式 (仅监听 127.0.0.1:8443 + 80 端口申请证书，适合本机 443 已被 Sing-box 占用)"
+    read -r -p "请选择监听模式 [1-2, 默认 1]: " listen_mode
+    listen_mode="${listen_mode:-1}"
+
+    if [[ "$listen_mode" == "2" ]]; then
+        read -r -p "请输入本地 HTTPS 回源端口 [默认 ${DEFAULT_REALITY_CADDY_PORT}]: " local_https_port
+        local_https_port="${local_https_port:-$DEFAULT_REALITY_CADDY_PORT}"
+        ensure_caddy "reality" "$local_https_port"
+    else
+        ensure_caddy "standalone"
+    fi
+
+    # 选择行业模板
+    change_website_menu
+
+    local caddy_file="$CADDY_CONF_DIR/${site_domain}.conf"
+    if [[ -f "$caddy_file" ]]; then
+        cp -a "$caddy_file" "$BACKUP_DIR/caddy/${site_domain}.conf"
+    fi
+
+    if [[ "$listen_mode" == "2" ]]; then
+        cat << EOF > "$caddy_file"
+https://${site_domain}:${local_https_port} {
+    bind 127.0.0.1
+    tls {
+        issuer acme {
+            disable_tlsalpn_challenge
+        }
+    }
+    root * ${WEB_ROOT}
+    file_server
+}
+
+http://${site_domain}:80 {
+    redir https://${site_domain}{uri} permanent
+}
+EOF
+    else
+        cat << EOF > "$caddy_file"
+${site_domain} {
+    root * ${WEB_ROOT}
+    file_server
+}
+EOF
+    fi
+
+    log_ok "已生成 Caddy 静态站点配置: $caddy_file"
+    restart_caddy
+
+    echo ""
+    echo -e "${GREEN}======================================================================${NC}"
+    echo -e "${GREEN} 🎉 独立静态伪装网站 (Caddy + 自动 HTTPS) 部署完成！${NC}"
+    echo -e "${GREEN}======================================================================${NC}"
+    echo -e "🌐 网站域名       : ${GREEN}https://${site_domain}${NC}"
+    echo -e "📄 Caddy 配置文件 : ${YELLOW}${caddy_file}${NC}"
+    echo -e "🎨 网站行业模板   : ${CYAN}${SITE_NAME}${NC} (${WEB_ROOT}/index.html)"
+    echo -e "${GREEN}======================================================================${NC}"
+}
+
+# ==============================================================================
+# 功能 5：单独更换静态网站模板菜单
 # ==============================================================================
 change_website_menu() {
     echo ""
-    echo -e "${CYAN}请选择要部署的静态伪装网站模板：${NC}"
+    echo -e "${CYAN}请选择要部署到 ${WEB_ROOT} 的静态伪装网站模板：${NC}"
     echo -e "  [${GREEN}1${NC}] NebulaCloud Enterprise  (云原生可观测性与边缘计算 SaaS 平台)"
     echo -e "  [${GREEN}2${NC}] Synapse Dynamics        (具身智能与工业自动化机器人研究院)"
     echo -e "  [${GREEN}3${NC}] Aethelgard Quantitative (量化算法与全球流动性研究机构)"
@@ -978,24 +1160,32 @@ change_website_menu() {
 # ==============================================================================
 show_main_menu() {
     clear 2>/dev/null || true
-    echo -e "${BLUE}======================================================================${NC}"
-    echo -e "${GREEN}       Sing-box (233boy) & Caddy 协议伪装一键优化脚本 (支持自偷站)      ${NC}"
-    echo -e "${BLUE}======================================================================${NC}"
+    echo -e "${BLUE}================================================================================${NC}"
+    echo -e "${GREEN}         Sing-box (233boy) & Caddy 协议伪装与静态建站一键优化脚本               ${NC}"
+    echo -e "${BLUE}================================================================================${NC}"
     echo -e "  [${GREEN}1${NC}] 一键优化 ${CYAN}VMess-WS-TLS${NC} 协议 (自动提取域名/端口 + Caddy 防探测 + 随机静态站)"
-    echo -e "  [${GREEN}2${NC}] 一键修改 ${CYAN}VLESS-REALITY${NC} 协议 (改为偷本机域名 + Caddy 自动签发证书 + 随机静态站)"
-    echo -e "  [${GREEN}3${NC}] 仅更换 ${CYAN}/var/www/html${NC} 静态伪装网站模板 (内置 5 套行业站点)"
+    echo -e "  [${GREEN}2${NC}] 一键修改 ${CYAN}VLESS-REALITY [自偷本机域名]${NC} (本机建 Caddy 静态站 + 偷 127.0.0.1)"
+    echo -e "  [${GREEN}3${NC}] 一键修改 ${CYAN}VLESS-REALITY [偷相邻/外部域名]${NC} (无需本机建站，直接改 SNI 与握手目标)"
+    echo -e "  [${GREEN}4${NC}] 一键部署 ${CYAN}Caddy + 静态伪装网站${NC} (输入域名自动开启 HTTPS 站点，供本机或邻机使用)"
+    echo -e "  [${GREEN}5${NC}] 仅更换 ${CYAN}/var/www/html${NC} 静态网站 HTML 模板 (内置 5 套行业响应式网站)"
     echo -e "  [${GREEN}0${NC}] 退出脚本"
-    echo -e "${BLUE}======================================================================${NC}"
-    read -r -p "请输入操作序号 [0-3]: " menu_choice
+    echo -e "${BLUE}================================================================================${NC}"
+    read -r -p "请输入操作序号 [0-5]: " menu_choice
 
     case "$menu_choice" in
         1)
             optimize_vmess_ws_tls
             ;;
         2)
-            optimize_vless_reality
+            optimize_vless_reality_self
             ;;
         3)
+            optimize_vless_reality_neighbor
+            ;;
+        4)
+            deploy_standalone_caddy_site
+            ;;
+        5)
             change_website_menu
             ;;
         0)
@@ -1003,7 +1193,7 @@ show_main_menu() {
             exit 0
             ;;
         *)
-            log_err "输入无效，请输入 0-3 之间的数字！"
+            log_err "输入无效，请输入 0-5 之间的数字！"
             exit 1
             ;;
     esac
@@ -1015,14 +1205,19 @@ if [[ $# -gt 0 ]]; then
         vmess|--vmess)
             optimize_vmess_ws_tls
             ;;
-        reality|--reality)
-            optimize_vless_reality
+        reality-self|--reality-self)
+            optimize_vless_reality_self
+            ;;
+        reality|--reality|reality-neighbor|--reality-neighbor)
+            optimize_vless_reality_neighbor
+            ;;
+        site|--site)
+            deploy_standalone_caddy_site
             ;;
         web|--web)
             change_website_menu
             ;;
         *)
-            # 兼容旧版直接传自定义 WS 路径的用法
             DEFAULT_WS_PATH="$1"
             optimize_vmess_ws_tls
             ;;
