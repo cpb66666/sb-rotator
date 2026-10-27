@@ -9,7 +9,7 @@
 #   [5] 仅更换 /var/www/html 静态伪装网站模板 (内置 5 套跨行业响应式站点，支持随机或指定)
 # ==============================================================================
 
-set -euo pipefail
+set -uo pipefail
 
 # 颜色定义
 RED='\033[0;31m'
@@ -30,6 +30,9 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
+# 将 233boy 常见安装路径加入 PATH，避免因 PATH 不全找不到已安装的 caddy 或 sing-box
+export PATH="/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin:$PATH"
+
 SINGBOX_CONF_DIR="/etc/sing-box/conf"
 CADDY_MAIN_CONF="/etc/caddy/Caddyfile"
 CADDY_CONF_DIR="/etc/caddy/233boy"
@@ -47,21 +50,22 @@ PARSER=""
 ensure_parser() {
     if command -v jq >/dev/null 2>&1; then
         PARSER="jq"
-        return
+        return 0
     elif command -v python3 >/dev/null 2>&1; then
         PARSER="python3"
-        return
+        return 0
     fi
 
     log_info "正在安装 jq 以解析 JSON 配置文件..."
     if command -v apt-get >/dev/null 2>&1; then
-        apt-get update -y >/dev/null 2>&1 && apt-get install -y jq >/dev/null 2>&1
+        DEBIAN_FRONTEND=noninteractive apt-get update -y || true
+        DEBIAN_FRONTEND=noninteractive apt-get install -y jq || true
     elif command -v yum >/dev/null 2>&1; then
-        yum install -y jq >/dev/null 2>&1
+        yum install -y jq || true
     elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y jq >/dev/null 2>&1
+        dnf install -y jq || true
     elif command -v apk >/dev/null 2>&1; then
-        apk add --no-cache jq >/dev/null 2>&1
+        apk add --no-cache jq || true
     fi
 
     if command -v jq >/dev/null 2>&1; then
@@ -72,46 +76,112 @@ ensure_parser() {
     fi
 }
 
+install_caddy_binary_fallback() {
+    log_info "正在尝试从 GitHub Releases 直接下载官方 Caddy 二进制包与 systemd 服务..."
+    local arch
+    arch=$(uname -m)
+    local caddy_arch="amd64"
+    case "$arch" in
+        x86_64|amd64) caddy_arch="amd64" ;;
+        aarch64|arm64) caddy_arch="arm64" ;;
+        armv7*) caddy_arch="armv7" ;;
+        *)
+            log_err "不支持的 CPU 架构: $arch"
+            return 1
+            ;;
+    esac
+
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
+    local dl_url="https://github.com/caddyserver/caddy/releases/latest/download/caddy_2.8.4_linux_${caddy_arch}.tar.gz"
+    # 动态获取最新版本号（若获取失败则回退到稳定版 2.8.4）
+    local latest_tag=""
+    latest_tag=$(curl -fsSL https://api.github.com/repos/caddyserver/caddy/releases/latest 2>/dev/null | grep -oP '"tag_name":\s*"v\K[^"]+' || true)
+    if [[ -n "$latest_tag" ]]; then
+        dl_url="https://github.com/caddyserver/caddy/releases/download/v${latest_tag}/caddy_${latest_tag}_linux_${caddy_arch}.tar.gz"
+    fi
+
+    if curl -fL "$dl_url" -o "$tmp_dir/caddy.tar.gz"; then
+        tar -xzf "$tmp_dir/caddy.tar.gz" -C "$tmp_dir" caddy
+        install -m 0755 "$tmp_dir/caddy" /usr/bin/caddy
+        rm -rf "$tmp_dir"
+    else
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    # 创建 caddy 用户组与 systemd unit
+    groupadd --system caddy 2>/dev/null || true
+    useradd --system \
+        --gid caddy \
+        --create-home --home-dir /var/lib/caddy \
+        --shell /usr/sbin/nologin \
+        --comment "Caddy web server" \
+        caddy 2>/dev/null || true
+
+    cat << 'EOF' > /etc/systemd/system/caddy.service
+[Unit]
+Description=Caddy
+Documentation=https://caddyserver.com/docs/
+After=network.target network-online.target
+Requires=network-online.target
+
+[Service]
+Type=notify
+User=root
+Group=root
+ExecStart=/usr/bin/caddy run --environ --config /etc/caddy/Caddyfile
+ExecReload=/usr/bin/caddy reload --config /etc/caddy/Caddyfile --force
+TimeoutStopSec=5s
+LimitNOFILE=1048576
+PrivateTmp=true
+ProtectSystem=full
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload || true
+    return 0
+}
+
 ensure_caddy() {
     local mode="${1:-vmess}"       # vmess / standalone 或 reality
-    local https_port="${2:-8443}"  # 当 mode=reality 且全新初始化 Caddyfile 时使用的 https_port
+    local https_port="${2:-8443}"  # 当 mode=reality 时使用的 https_port
 
     mkdir -p "$BACKUP_DIR/caddy" "$CADDY_CONF_DIR" "$WEB_ROOT"
 
     if ! command -v caddy >/dev/null 2>&1; then
-        log_warn "未检测到 Caddy，正在为您自动安装 Caddy..."
+        log_warn "未检测到 Caddy，正在为您自动安装 Caddy (显示安装进度)..."
         if command -v apt-get >/dev/null 2>&1; then
-            apt-get update -y >/dev/null 2>&1
-            apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl gpg >/dev/null 2>&1 || true
-            if [[ ! -f /usr/share/keyrings/caddy-stable-archive-keyring.gpg ]]; then
-                curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg 2>/dev/null || true
-                curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' > /etc/apt/sources.list.d/caddy-stable.list 2>/dev/null || true
-                apt-get update -y >/dev/null 2>&1 || true
-            fi
-            apt-get install -y caddy >/dev/null 2>&1
+            # 清理可能残留的损坏源，防止 apt-get update 返回非 0 退出码
+            rm -f /etc/apt/sources.list.d/caddy-stable.list
+            DEBIAN_FRONTEND=noninteractive apt-get update -y || true
+            DEBIAN_FRONTEND=noninteractive apt-get install -y caddy curl ca-certificates || true
         elif command -v dnf >/dev/null 2>&1; then
-            dnf install -y 'dnf-command(copr)' >/dev/null 2>&1 || true
-            dnf copr enable -y @caddy/caddy >/dev/null 2>&1 || true
-            dnf install -y caddy >/dev/null 2>&1
+            dnf install -y caddy curl ca-certificates || true
         elif command -v yum >/dev/null 2>&1; then
-            yum install -y yum-plugin-copr >/dev/null 2>&1 || true
-            yum copr enable -y @caddy/caddy >/dev/null 2>&1 || true
-            yum install -y caddy >/dev/null 2>&1
+            yum install -y caddy curl ca-certificates || true
         elif command -v apk >/dev/null 2>&1; then
-            apk add --no-cache caddy >/dev/null 2>&1
+            apk add --no-cache caddy curl ca-certificates || true
+        fi
+
+        # 若系统默认软件源未包含 caddy，则使用官方二进制回退方案安装
+        if ! command -v caddy >/dev/null 2>&1; then
+            install_caddy_binary_fallback || true
         fi
 
         if ! command -v caddy >/dev/null 2>&1; then
-            log_err "Caddy 自动安装失败，请先手动安装 Caddy 后重试！"
+            log_err "Caddy 自动安装失败！请先运行 233boy 脚本安装 Caddy (sing-box -> 安装 Caddy) 或执行 apt install -y caddy 后重试。"
             exit 1
         fi
         systemctl enable caddy >/dev/null 2>&1 || true
-        log_ok "Caddy 安装完成"
+        log_ok "Caddy 安装完成: $(caddy version 2>/dev/null || echo 'OK')"
     fi
 
-    # 确保 /etc/caddy/Caddyfile 存在且包含 import /etc/caddy/233boy/*.conf
+    # 校验并修正 /etc/caddy/Caddyfile
     if [[ ! -f "$CADDY_MAIN_CONF" ]]; then
-        log_info "正在创建默认主配置文件 $CADDY_MAIN_CONF ..."
+        log_info "正在创建主配置文件 $CADDY_MAIN_CONF ..."
         if [[ "$mode" == "reality" ]]; then
             cat << EOF > "$CADDY_MAIN_CONF"
 {
@@ -127,11 +197,34 @@ EOF
         fi
         log_ok "已初始化 $CADDY_MAIN_CONF"
     else
+        cp -a "$CADDY_MAIN_CONF" "$BACKUP_DIR/caddy/Caddyfile.bak"
+        # Debian/Ubuntu apt 安装的默认 Caddyfile 含有 :80 欢迎站点且没有 import /etc/caddy/233boy/*.conf
         if ! grep -q "${CADDY_CONF_DIR}" "$CADDY_MAIN_CONF"; then
-            cp -a "$CADDY_MAIN_CONF" "$BACKUP_DIR/caddy/Caddyfile.bak"
-            echo "" >> "$CADDY_MAIN_CONF"
-            echo "import ${CADDY_CONF_DIR}/*.conf" >> "$CADDY_MAIN_CONF"
-            log_ok "已在 $CADDY_MAIN_CONF 中追加 import ${CADDY_CONF_DIR}/*.conf"
+            log_info "正在更新 $CADDY_MAIN_CONF 以加载 ${CADDY_CONF_DIR}/*.conf ..."
+            if [[ "$mode" == "reality" ]]; then
+                cat << EOF > "$CADDY_MAIN_CONF"
+{
+    http_port 80
+    https_port ${https_port}
+}
+import ${CADDY_CONF_DIR}/*.conf
+EOF
+            else
+                cat << EOF > "$CADDY_MAIN_CONF"
+import ${CADDY_CONF_DIR}/*.conf
+EOF
+            fi
+            log_ok "已配置 $CADDY_MAIN_CONF 加载 ${CADDY_CONF_DIR}/*.conf"
+        elif [[ "$mode" == "reality" ]] && ! grep -q "https_port" "$CADDY_MAIN_CONF"; then
+            # 如果已是 233boy 的 Caddyfile 但还没有 https_port，为 reality 本地回源模式写入 https_port
+            cat << EOF > "$CADDY_MAIN_CONF"
+{
+    http_port 80
+    https_port ${https_port}
+}
+import ${CADDY_CONF_DIR}/*.conf
+EOF
+            log_ok "已更新 $CADDY_MAIN_CONF 的 https_port 为 ${https_port}"
         fi
     fi
 }
@@ -505,7 +598,7 @@ restart_singbox() {
     fi
 
     if systemctl is-active --quiet sing-box || systemctl list-unit-files | grep -q "^sing-box\.service"; then
-        systemctl restart sing-box
+        systemctl restart sing-box || log_warn "sing-box 重启返回非 0 状态，请执行 systemctl status sing-box 查看详情"
         log_ok "sing-box 服务已重启"
     else
         log_warn "未检测到 systemd 中的 sing-box 服务，请手动重启 sing-box"
@@ -514,10 +607,12 @@ restart_singbox() {
 
 restart_caddy() {
     if systemctl is-active --quiet caddy || systemctl list-unit-files | grep -q "^caddy\.service"; then
-        systemctl reload caddy 2>/dev/null || systemctl restart caddy
+        systemctl reload caddy 2>/dev/null || systemctl restart caddy || log_warn "caddy 启动异常，请检查 80/443 端口是否被占用 (systemctl status caddy)"
         log_ok "caddy 服务已重载/重启"
     else
-        log_warn "未检测到 systemd 中的 caddy 服务，请手动重启 caddy"
+        log_warn "未检测到 systemd 中的 caddy 服务，尝试直接后台启动 caddy..."
+        caddy stop >/dev/null 2>&1 || true
+        caddy start --config "$CADDY_MAIN_CONF" && log_ok "caddy 已启动" || log_warn "caddy 启动失败，请检查端口占用"
     fi
 }
 
@@ -569,7 +664,7 @@ PYEOF
 
     if [[ ${#reality_files[@]} -eq 0 ]]; then
         log_err "在 $SINGBOX_CONF_DIR 中未找到任何启用了 REALITY 的 VLESS 配置文件！"
-        return 1
+        exit 1
     fi
 
     if [[ ${#reality_files[@]} -eq 1 ]]; then
@@ -592,7 +687,7 @@ PYEOF
             REALITY_TARGET_FILES=("${reality_files[$((file_choice - 1))]}")
         else
             log_err "无效的序号选择"
-            return 1
+            exit 1
         fi
     fi
 }
@@ -954,7 +1049,7 @@ optimize_vless_reality_neighbor() {
     echo ""
     local target_sni=""
     while [[ -z "$target_sni" ]]; do
-        read -r -p "请输入要借用的相邻节点域名或同机房目标域名 (SNI，如 us02.subscription.men): " target_sni
+        read -r -p "请输入要借用的相邻节点域名或同机房目标域名 (SNI，如 ny.subscription.men): " target_sni
         target_sni=$(echo "$target_sni" | tr -d '[:space:]')
         target_sni="${target_sni#http://}"
         target_sni="${target_sni#https://}"
@@ -1057,7 +1152,7 @@ deploy_standalone_caddy_site() {
     echo ""
     local site_domain=""
     while [[ -z "$site_domain" ]]; do
-        read -r -p "请输入要部署静态伪装网站的域名 (需已解析到本机 IP，如 web.example.com): " site_domain
+        read -r -p "请输入要部署静态伪装网站的域名 (需已解析到本机 IP，如 ny.subscription.men): " site_domain
         site_domain=$(echo "$site_domain" | tr -d '[:space:]')
         site_domain="${site_domain#http://}"
         site_domain="${site_domain#https://}"
@@ -1068,16 +1163,27 @@ deploy_standalone_caddy_site() {
         fi
     done
 
+    # 自动检测 443 端口是否已被 sing-box 占用，给出智能默认建议
+    local port443_process=""
+    if command -v ss >/dev/null 2>&1; then
+        port443_process=$(ss -tulpn 2>/dev/null | grep -E ':443\b' || true)
+    fi
+
     echo ""
+    if [[ -n "$port443_process" ]]; then
+        log_warn "检测到本机 443 端口已被占用 (可能是 Sing-box REALITY 正在监听 443)。"
+        log_warn "如果本机同时跑着监听 443 的服务，建议选择模式 [2]；若这台机器专门用来建站或跑 VMess，请选择模式 [1]。"
+    fi
     echo -e "${CYAN}请选择 Caddy 监听模式：${NC}"
-    echo -e "  [${GREEN}1${NC}] 标准公网 HTTPS 模式 (监听公网 80/443，适合独立建站或供相邻机器 REALITY 偷取)"
+    echo -e "  [${GREEN}1${NC}] 标准公网 HTTPS 模式 (监听公网 80/443，适合本机 443 未被 Sing-box 占用、专门建站供邻机偷取)"
     echo -e "  [${GREEN}2${NC}] 本地回源 HTTPS 模式 (仅监听 127.0.0.1:8443 + 80 端口申请证书，适合本机 443 已被 Sing-box 占用)"
     read -r -p "请选择监听模式 [1-2, 默认 1]: " listen_mode
     listen_mode="${listen_mode:-1}"
 
+    local local_https_port="$DEFAULT_REALITY_CADDY_PORT"
     if [[ "$listen_mode" == "2" ]]; then
-        read -r -p "请输入本地 HTTPS 回源端口 [默认 ${DEFAULT_REALITY_CADDY_PORT}]: " local_https_port
-        local_https_port="${local_https_port:-$DEFAULT_REALITY_CADDY_PORT}"
+        read -r -p "请输入本地 HTTPS 回源端口 [默认 ${DEFAULT_REALITY_CADDY_PORT}]: " input_port
+        local_https_port="${input_port:-$DEFAULT_REALITY_CADDY_PORT}"
         ensure_caddy "reality" "$local_https_port"
     else
         ensure_caddy "standalone"
