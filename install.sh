@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# install.sh - 233boy/sing-box 面板动态合租同步 & Clash API 多IP/动态流量共享限速 一键安装脚本 (v3.1.4)
+# install.sh - 233boy/sing-box 面板动态合租同步 & Clash API 多IP/动态流量共享限速 一键安装脚本 (v3.1.5)
 # 使用方式:
 #   bash <(curl -fsSL https://raw.githubusercontent.com/cpb66666/zidonghuanmi/main/install.sh)
 # ==============================================================================
@@ -70,7 +70,7 @@ deploy_core_script() {
     cat > "${INSTALL_BIN}" <<'__EOF_SB_ROTATOR_CORE__'
 #!/usr/bin/env bash
 # ==============================================================================
-# sb-rotator.sh - 233boy/sing-box 面板动态合租同步 & Clash API 多IP/动态流量限速系统 (v3.1.4)
+# sb-rotator.sh - 233boy/sing-box 面板动态合租同步 & Clash API 多IP/动态流量限速系统 (v3.1.5)
 # 核心能力:
 #   1. 自动扫描 /etc/sing-box/conf/*.json，提取管理员默认链接并通过 POST /api/v1/server/register 上报注册
 #   2. 同步响应 & Push 回调监听 (POST /api/v1/sync): 按协议 cred_type (uuid/password) 动态注入/移除合租用户，保留管理员默认账号
@@ -84,7 +84,7 @@ deploy_core_script() {
 set -o pipefail
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-VERSION="3.1.4"
+VERSION="3.1.5"
 INSTALL_DIR="${INSTALL_DIR:-/etc/sb-rotator}"
 CONFIG_FILE="${CONFIG_FILE:-${INSTALL_DIR}/config.env}"
 ADMIN_ACCOUNTS_FILE="${ADMIN_ACCOUNTS_FILE:-${INSTALL_DIR}/admin_accounts.json}"
@@ -231,7 +231,7 @@ load_config() {
 save_config() {
     ensure_dirs
     cat > "${CONFIG_FILE}" <<EOF
-# sb-rotator v3.1.4 配置文件 (面板同步 + Clash API 多IP与动态流量限速)
+# sb-rotator v3.1.5 配置文件 (面板同步 + Clash API 多IP与动态流量限速)
 PANEL_URL="${PANEL_URL}"
 API_KEY="${API_KEY}"
 SERVER_ID="${SERVER_ID:-1}"
@@ -301,7 +301,7 @@ write_python_daemon() {
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-sb_agent_daemon.py - 233boy/sing-box 节点注册、Push 同步回调与 Clash API 多IP/动态流量限速守护进程 (v3.1.4)
+sb_agent_daemon.py - 233boy/sing-box 节点注册、Push 同步回调与 Clash API 多IP/动态流量限速守护进程 (v3.1.5)
 """
 
 import os
@@ -333,7 +333,7 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
         self.server_name = "sb-agent"
         self.server_port = self.server_address[1]
 
-DAEMON_VERSION = "3.1.4"
+DAEMON_VERSION = "3.1.5"
 INSTALL_DIR = os.environ.get("INSTALL_DIR", "/etc/sb-rotator")
 CONFIG_FILE = os.environ.get("CONFIG_FILE", os.path.join(INSTALL_DIR, "config.env"))
 ADMIN_ACCOUNTS_FILE = os.environ.get("ADMIN_ACCOUNTS_FILE", os.path.join(INSTALL_DIR, "admin_accounts.json"))
@@ -344,8 +344,6 @@ CACHE_DIR = os.environ.get("CACHE_DIR", os.path.join(INSTALL_DIR, "cache"))
 LOG_FILE = os.environ.get("LOG_FILE", "/var/log/sb-rotator.log")
 SB_CONF_DIR = os.environ.get("SB_CONF_DIR", "/etc/sing-box/conf")
 SB_GLOBAL_CONFIG = os.environ.get("SB_GLOBAL_CONFIG", "/etc/sing-box/config.json")
-CADDY_CONF_DIR = os.environ.get("CADDY_CONF_DIR", "/etc/caddy/233boy")
-CADDY_MAIN_FILE = os.environ.get("CADDY_MAIN_FILE", "/etc/caddy/Caddyfile")
 
 SYNC_LOCK = threading.Lock()
 LIMIT_LOCK = threading.Lock()
@@ -563,250 +561,67 @@ def extract_proxy_url(text):
     return ""
 
 
-def parse_caddy_tls_proxy(listen_port, shortname):
-    """
-    扫描 /etc/caddy/233boy/*.conf 及节点文件名，识别通过 Caddy 反代本地端口 (如 127.0.0.1:63708) 的 WS-TLS 节点，
-    提取真实的外部域名 (host/sni)、外部 HTTPS 端口 (默认 443) 与反代路径 (path)。
-    支持用户移除了 transport.headers.host 并自定义了 path / max_early_data 的修改版配置。
-    """
-    default_https_port = 443
-    if os.path.isfile(CADDY_MAIN_FILE):
-        try:
-            with open(CADDY_MAIN_FILE, "r", encoding="utf-8", errors="ignore") as f:
-                m_hp = re.search(r"^\s*https_port\s+(\d+)", f.read(), re.M)
-                if m_hp:
-                    default_https_port = int(m_hp.group(1))
-        except Exception:
-            pass
-
-    domain_from_name = ""
-    m_name = re.match(r"^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*-TLS-(.+)$", shortname, re.I)
-    if m_name:
-        domain_from_name = m_name.group(1).strip()
-
-    matched_domain = ""
-    matched_port = default_https_port
-    matched_path = ""
-
-    if os.path.isdir(CADDY_CONF_DIR):
-        try:
-            cfiles = sorted([f for f in os.listdir(CADDY_CONF_DIR) if f.endswith(".conf")])
-        except Exception:
-            cfiles = []
-
-        # 1) 优先按 reverse_proxy 127.0.0.1:<listen_port> 精确匹配 Caddy 配置文件
-        for cf in cfiles:
-            cpath = os.path.join(CADDY_CONF_DIR, cf)
-            try:
-                with open(cpath, "r", encoding="utf-8", errors="ignore") as f:
-                    content = f.read()
-            except Exception:
-                continue
-            if listen_port and re.search(rf"reverse_proxy\s+(?:127\.0\.0\.1|localhost)?\s*:{listen_port}\b", content):
-                m_site = re.search(r"^\s*(?:https?://)?([A-Za-z0-9._-]+)(?::(\d+))?\s*\{", content, re.M)
-                if m_site:
-                    matched_domain = m_site.group(1).strip()
-                    if m_site.group(2):
-                        matched_port = int(m_site.group(2))
-                else:
-                    matched_domain = cf[:-5]
-                m_p = re.search(r"\bpath\s+(/[^\s*{}]+)", content)
-                if m_p:
-                    matched_path = m_p.group(1).strip()
-                break
-
-        # 2) 其次按文件名中的域名匹配 /etc/caddy/233boy/<domain>.conf
-        if not matched_domain and domain_from_name:
-            cand_conf = os.path.join(CADDY_CONF_DIR, f"{domain_from_name}.conf")
-            if os.path.isfile(cand_conf):
-                matched_domain = domain_from_name
-                try:
-                    with open(cand_conf, "r", encoding="utf-8", errors="ignore") as f:
-                        content = f.read()
-                    m_site = re.search(r"^\s*(?:https?://)?([A-Za-z0-9._-]+)(?::(\d+))?\s*\{", content, re.M)
-                    if m_site and m_site.group(2):
-                        matched_port = int(m_site.group(2))
-                    m_p = re.search(r"\bpath\s+(/[^\s*{}]+)", content)
-                    if m_p:
-                        matched_path = m_p.group(1).strip()
-                except Exception:
-                    pass
-
-    final_domain = matched_domain or domain_from_name
-    return {
-        "is_caddy_tls": bool(final_domain),
-        "domain": final_domain,
-        "port": matched_port if final_domain else listen_port,
-        "path": matched_path,
-    }
-
-
-def resolve_inbound_endpoint(shortname, inbound, srv_ip):
-    """
-    综合解析 sing-box inbound 配置、Caddy 反代配置与文件名，返回客户端真实连接参数。
-    """
-    listen = str(inbound.get("listen") or "").strip()
-    listen_port = int(inbound.get("listen_port") or 0)
-    if not listen_port:
-        m = re.search(r"-(\d+)$", shortname)
-        if m:
-            listen_port = int(m.group(1))
-
+def build_fallback_url(proto, port, cred, shortname, inbound, srv_ip):
+    tls = inbound.get("tls") if isinstance(inbound.get("tls"), dict) else {}
+    sni = tls.get("server_name") or ""
     transport = inbound.get("transport") if isinstance(inbound.get("transport"), dict) else {}
     net_type = str(transport.get("type") or "").lower().strip()
     ws_path = str(transport.get("path") or "").strip()
     headers = transport.get("headers") if isinstance(transport.get("headers"), dict) else {}
     hdr_host = str(headers.get("host") or headers.get("Host") or "").strip()
+    connect_host = hdr_host or sni or srv_ip
 
-    tls_block = inbound.get("tls") if isinstance(inbound.get("tls"), dict) else {}
-    tls_sni = str(tls_block.get("server_name") or "").strip()
-    tls_enabled = bool(tls_block.get("enabled")) or bool(tls_sni)
-
-    caddy_info = parse_caddy_tls_proxy(listen_port, shortname)
-    is_caddy_tls = caddy_info["is_caddy_tls"] or ("-tls-" in shortname.lower()) or (listen == "127.0.0.1" and bool(hdr_host))
-
-    domain = hdr_host or caddy_info["domain"] or tls_sni
-    ext_port = caddy_info["port"] if is_caddy_tls else listen_port
-    if is_caddy_tls and (not ext_port or ext_port == listen_port):
-        ext_port = 443
-    final_path = ws_path or caddy_info["path"] or ("/" if net_type == "ws" else "")
-    max_early_data = int(transport.get("max_early_data") or 0)
-    early_data_header_name = str(transport.get("early_data_header_name") or "")
-    if net_type == "ws" and max_early_data > 0 and final_path and not re.search(r"[?&]ed=\d+", final_path):
-        sep = "&" if "?" in final_path else "?"
-        final_path = f"{final_path}{sep}ed={max_early_data}"
-
-    is_tls = is_caddy_tls or tls_enabled
-
-    return {
-        "connect_host": domain if domain else srv_ip,
-        "domain": domain,
-        "ext_port": ext_port,
-        "listen_port": listen_port,
-        "net_type": net_type or "tcp",
-        "path": final_path,
-        "is_tls": is_tls,
-        "is_caddy_tls": is_caddy_tls,
-        "max_early_data": max_early_data,
-        "early_data_header_name": early_data_header_name,
-    }
-
-
-def build_vmess_base64_url(cred, shortname, inbound, srv_ip, ep=None):
-    """
-    构建标准 V2RayN Base64 JSON 格式的 vmess:// 节点分享链接，
-    完整支持修改后的 VMess-WS-TLS (Caddy 反代) 并在 TLS 模式下自动注入客户端 uTLS 指纹 fp=firefox。
-    """
-    if ep is None:
-        ep = resolve_inbound_endpoint(shortname, inbound, srv_ip)
-    connect_host = ep["connect_host"]
-    domain = ep["domain"] or connect_host
-    ext_port = ep["ext_port"]
-    net_type = ep["net_type"] or "ws"
-    ws_path = ep["path"] or "/"
-    is_tls = ep["is_tls"]
-
-    vmess_obj = {
-        "v": "2",
-        "ps": shortname,
-        "add": connect_host,
-        "port": str(ext_port),
-        "id": str(cred),
-        "aid": "0",
-        "scy": "auto",
-        "net": net_type,
-        "type": "none",
-        "host": domain if net_type in ("ws", "http", "h2", "httpupgrade") else "",
-        "path": ws_path if net_type in ("ws", "http", "h2", "grpc", "httpupgrade") else "",
-        "tls": "tls" if is_tls else "",
-        "sni": domain if is_tls else "",
-        "alpn": "",
-        "fp": "firefox" if is_tls else "",
-    }
-    raw_json = json.dumps(vmess_obj, ensure_ascii=False, separators=(",", ":"))
-    b64_str = base64.b64encode(raw_json.encode("utf-8")).decode("ascii")
-    return f"vmess://{b64_str}"
-
-
-def decode_vmess_url_summary(url):
-    if not url or not url.lower().startswith("vmess://"):
-        return ""
-    b64_part = url[8:].strip()
-    pad = (-len(b64_part)) % 4
-    try:
-        raw = base64.b64decode(b64_part + ("=" * pad)).decode("utf-8", errors="ignore")
-        obj = json.loads(raw)
-        if isinstance(obj, dict):
-            return (
-                f"地址={obj.get('add')}:{obj.get('port')} | 传输={obj.get('net')} | "
-                f"路径={obj.get('path') or '-'} | Host/SNI={obj.get('host') or obj.get('sni') or '-'} | "
-                f"TLS={obj.get('tls') or 'none'} | uTLS指纹(fp)={obj.get('fp') or '-'}"
-            )
-    except Exception:
-        pass
-    return ""
-
-
-def build_fallback_url(proto, port, cred, shortname, inbound, srv_ip):
-    ep = resolve_inbound_endpoint(shortname, inbound, srv_ip)
-    if proto == "vmess":
-        return build_vmess_base64_url(cred, shortname, inbound, srv_ip, ep=ep)
-
-    connect_host = ep["connect_host"]
-    ext_port = ep["ext_port"] or port
-    sni = ep["domain"] or ""
-    net_type = ep["net_type"]
-    ws_path = ep["path"]
     users = inbound.get("users") or [{}]
-    first_u = users[0] if users else {}
+    first_u = users[0] if (users and isinstance(users[0], dict)) else {}
     flow = first_u.get("flow") or ""
 
-    if proto == "anytls":
-        q = f"security=tls&sni={sni}&fp=firefox&insecure=1" if sni else "security=tls&fp=firefox&insecure=1"
-        return f"anytls://{cred}@{connect_host}:{ext_port}?{q}#{shortname}"
+    if proto == "vmess":
+        is_tls = bool(tls.get("enabled")) or bool(sni) or ("-tls-" in shortname.lower())
+        ext_port = 443 if (is_tls and str(inbound.get("listen") or "") == "127.0.0.1") else port
+        vmess_obj = {
+            "v": "2",
+            "ps": shortname,
+            "add": connect_host,
+            "port": str(ext_port),
+            "id": str(cred),
+            "aid": "0",
+            "scy": "auto",
+            "net": net_type or "tcp",
+            "type": "none",
+            "host": hdr_host or sni,
+            "path": ws_path,
+            "tls": "tls" if is_tls else "",
+            "sni": sni or hdr_host,
+        }
+        raw_json = json.dumps(vmess_obj, ensure_ascii=False, separators=(",", ":"))
+        b64_str = base64.b64encode(raw_json.encode("utf-8")).decode("ascii")
+        return f"vmess://{b64_str}"
+    elif proto == "anytls":
+        q = f"security=tls&sni={sni}&insecure=1" if sni else "security=tls&insecure=1"
+        return f"anytls://{cred}@{srv_ip}:{port}?{q}#{shortname}"
     elif proto in ("hysteria2", "hy2"):
-        return f"hysteria2://{cred}@{connect_host}:{ext_port}?alpn=h3&insecure=1&sni={sni or 'www.bing.com'}#{shortname}"
+        return f"hysteria2://{cred}@{srv_ip}:{port}?alpn=h3&insecure=1&sni={sni or 'www.bing.com'}#{shortname}"
     elif proto == "vless":
-        params = ["encryption=none"]
-        if flow:
-            params.append(f"flow={flow}")
-        if ep["is_tls"]:
-            params.append("security=tls")
-            if sni:
-                params.append(f"sni={sni}")
-            params.append("fp=firefox")
-        if net_type == "ws":
-            params.append("type=ws")
-            if sni:
-                params.append(f"host={sni}")
-            if ws_path:
-                params.append(f"path={urllib.parse.quote(ws_path, safe='')}")
-        return f"vless://{cred}@{connect_host}:{ext_port}?{'&'.join(params)}#{shortname}"
+        q = f"encryption=none{f'&flow={flow}' if flow else ''}&security=tls{f'&sni={sni}' if sni else ''}"
+        return f"vless://{cred}@{srv_ip}:{port}?{q}#{shortname}"
     elif proto == "trojan":
-        params = ["security=tls"]
-        if sni:
-            params.append(f"sni={sni}")
-        params.append("fp=firefox")
-        if net_type == "ws":
-            params.append("type=ws")
-            if sni:
-                params.append(f"host={sni}")
-            if ws_path:
-                params.append(f"path={urllib.parse.quote(ws_path, safe='')}")
-        return f"trojan://{cred}@{connect_host}:{ext_port}?{'&'.join(params)}#{shortname}"
-    return f"{proto}://{cred}@{connect_host}:{ext_port}#{shortname}"
+        return f"trojan://{cred}@{srv_ip}:{port}?security=tls{f'&sni={sni}' if sni else ''}#{shortname}"
+    return f"{proto}://{cred}@{srv_ip}:{port}#{shortname}"
 
 
 def discover_and_get_default_protocols():
+    """
+    自动扫描 /etc/sing-box/conf/*.json，每次实时读取最新配置文件内容与管理员凭据 (users[0])，
+    并实时提取每个协议的最新默认分享链接 (不使用旧链接缓存，确保配置文件修改后立即生效)。
+    """
     if not os.path.isdir(SB_CONF_DIR):
         return [], []
 
     files = sorted([f for f in os.listdir(SB_CONF_DIR) if f.endswith(".json")])
-    admin_accounts = load_json_file(ADMIN_ACCOUNTS_FILE, {})
     srv_ip = get_server_ip()
+    new_admin_accounts = {}
     protocols_list = []
     default_links = []
-    admin_changed = False
 
     for idx, fname in enumerate(files, start=1):
         fpath = os.path.join(SB_CONF_DIR, fname)
@@ -822,92 +637,81 @@ def discover_and_get_default_protocols():
         if not inbounds or not isinstance(inbounds[0], dict):
             continue
         ib = inbounds[0]
+        port = int(ib.get("listen_port") or 0)
+        if not port:
+            m = re.search(r"-(\d+)$", shortname)
+            if m:
+                port = int(m.group(1))
+
         users = ib.get("users") or []
         first_user = users[0] if (users and isinstance(users[0], dict)) else {}
         proto, cred_type, tag = normalize_protocol_info(ib.get("type"), shortname, first_user)
 
-        ep = resolve_inbound_endpoint(shortname, ib, srv_ip)
-        port = int(ep["ext_port"] or ib.get("listen_port") or 0)
+        # 始终从当前配置文件的 users[0] 实时提取管理员凭据与附加字段，确保用户手动修改配置文件后立即生效
+        admin_cred = first_user.get(cred_type) or first_user.get("uuid") or first_user.get("password") or ""
+        extra_fields = {
+            k: v for k, v in first_user.items() if k not in ("name", "uuid", "password")
+        }
 
-        saved = admin_accounts.get(fname) or {}
-        admin_cred = saved.get("credential")
-        extra_fields = saved.get("extra")
-        if not admin_cred:
-            admin_cred = first_user.get(cred_type) or first_user.get("uuid") or first_user.get("password") or ""
-            extra_fields = {
-                k: v for k, v in first_user.items() if k not in ("name", "uuid", "password")
-            }
-            admin_accounts[fname] = {
-                "protocol": proto,
-                "port": port,
-                "cred_type": cred_type,
-                "credential": admin_cred,
-                "extra": extra_fields,
-                "default_url": "",
-            }
-            admin_changed = True
-        else:
-            if extra_fields is None:
-                extra_fields = {
-                    k: v for k, v in first_user.items() if k not in ("name", "uuid", "password")
-                }
+        # 实时提取默认分享链接：临时将 users 写为纯单管理员用户(不带 name 字段)供 233boy sing-box url 提取最新链接，随后恢复
+        default_url = ""
+        orig_users = ib.get("users")
+        single_admin = dict(extra_fields or {})
+        single_admin[cred_type] = admin_cred
+        need_temp_write = (orig_users != [single_admin])
+        try:
+            if need_temp_write:
+                ib["users"] = [single_admin]
+                save_json_file(fpath, conf)
 
-        # 对 VMess (尤其是自定义修改了 path / max_early_data 且移除了 headers.host 的 VMess-WS-TLS)，
-        # 直接根据当前配置文件与 Caddy 反代配置实时生成带 fp=firefox 的标准 vmess:// 链接，不依赖 233boy sb url
-        if proto == "vmess":
-            default_url = build_vmess_base64_url(admin_cred, shortname, ib, srv_ip, ep=ep)
-        else:
-            default_url = saved.get("default_url") or ""
-            # 若是 Caddy 反代节点且旧缓存链接误用了内部端口(如 63708)，强制重新生成
-            if default_url and ep["is_caddy_tls"] and ep["listen_port"] and f":{ep['listen_port']}" in default_url:
-                default_url = ""
-            if not default_url:
-                orig_users = ib.get("users")
-                need_temp_single = isinstance(orig_users, list) and len(orig_users) > 1
-                try:
-                    if need_temp_single:
-                        single_admin = dict(extra_fields or {})
-                        single_admin[cred_type] = admin_cred
-                        ib["users"] = [single_admin]
-                        save_json_file(fpath, conf)
+            for cmd_args in (["url", shortname], ["url", str(port)], ["info", shortname]):
+                out = run_sb_cmd(cmd_args, idx=idx, timeout_sec=5)
+                default_url = extract_proxy_url(out)
+                if default_url:
+                    break
+        finally:
+            if need_temp_write:
+                ib["users"] = orig_users
+                save_json_file(fpath, conf)
 
-                    for cmd_args in (["url", shortname], ["url", str(ep["listen_port"] or port)], ["info", shortname]):
-                        out = run_sb_cmd(cmd_args, idx=idx, timeout_sec=5)
-                        default_url = extract_proxy_url(out)
-                        if default_url:
-                            break
-                finally:
-                    if need_temp_single:
-                        ib["users"] = orig_users
-                        save_json_file(fpath, conf)
+        # 若 sb url 未返回链接，直接基于当前最新配置构建链接 (绝不回退读取旧缓存链接)
+        if not default_url:
+            default_url = build_fallback_url(proto, port, admin_cred, shortname, ib, srv_ip)
 
-            if not default_url:
-                default_url = build_fallback_url(proto, port, admin_cred, shortname, ib, srv_ip)
+        if admin_cred and proto != "vmess":
+            default_url = re.sub(r"^([a-zA-Z0-9]+://)[^@]+@", rf"\g<1>{admin_cred}@", default_url)
 
-            if admin_cred:
-                default_url = re.sub(r"^([a-zA-Z0-9]+://)[^@]+@", rf"\g<1>{admin_cred}@", default_url)
+        # 若是 vmess 链接，尝试从其 base64 JSON 中读取实际外部端口 (如 443)
+        if proto == "vmess" and default_url.lower().startswith("vmess://"):
+            try:
+                b64_part = default_url[8:].strip()
+                pad = (-len(b64_part)) % 4
+                v_obj = json.loads(base64.b64decode(b64_part + ("=" * pad)).decode("utf-8", errors="ignore"))
+                if isinstance(v_obj, dict) and int(v_obj.get("port") or 0) > 0:
+                    port = int(v_obj["port"])
+            except Exception:
+                pass
 
-        if admin_accounts.get(fname, {}).get("default_url") != default_url or admin_accounts.get(fname, {}).get("port") != port:
-            admin_accounts.setdefault(fname, {})["default_url"] = default_url
-            admin_accounts.setdefault(fname, {})["port"] = port
-            admin_changed = True
+        new_admin_accounts[fname] = {
+            "protocol": proto,
+            "port": port,
+            "cred_type": cred_type,
+            "credential": admin_cred,
+            "extra": extra_fields,
+            "default_url": default_url,
+        }
 
         default_links.append(default_url)
-        proto_item = {
+        protocols_list.append({
             "protocol": proto,
             "port": port,
             "tag": tag,
             "cred_type": cred_type,
             "default_url": default_url,
             "config_name": fname,
-        }
-        if proto == "vmess":
-            proto_item["decoded_summary"] = decode_vmess_url_summary(default_url)
-        protocols_list.append(proto_item)
+        })
 
-    if admin_changed:
-        save_json_file(ADMIN_ACCOUNTS_FILE, admin_accounts)
-
+    save_json_file(ADMIN_ACCOUNTS_FILE, new_admin_accounts)
     return default_links, protocols_list
 
 
@@ -1017,18 +821,16 @@ def schedule_singbox_reload():
 
 def ensure_admin_accounts_fast():
     """
-    纯内存/文件级毫秒级初始化管理员默认凭据 (不调用耗时的 sing-box url 子进程)，
-    供 /api/v1/sync Push 接口高速处理使用，避免阻塞面板 HTTP 请求导致超时。
+    纯内存/文件级毫秒级读取最新管理员默认凭据 (不调用耗时的 sing-box url 子进程)，
+    每次直接从 /etc/sing-box/conf/*.json 的 users[0] 同步最新凭据与参数，确保配置文件修改后立即生效。
     """
     if not os.path.isdir(SB_CONF_DIR):
         return {}
     files = sorted([f for f in os.listdir(SB_CONF_DIR) if f.endswith(".json")])
-    admin_accounts = load_json_file(ADMIN_ACCOUNTS_FILE, {})
-    changed = False
+    old_accounts = load_json_file(ADMIN_ACCOUNTS_FILE, {})
+    new_accounts = {}
     for fname in files:
-        saved = admin_accounts.get(fname)
-        if isinstance(saved, dict) and saved.get("credential"):
-            continue
+        saved = old_accounts.get(fname) if isinstance(old_accounts, dict) else {}
         fpath = os.path.join(SB_CONF_DIR, fname)
         shortname = fname[:-5]
         try:
@@ -1044,9 +846,9 @@ def ensure_admin_accounts_fast():
         users = ib.get("users") or []
         first_user = users[0] if (users and isinstance(users[0], dict)) else {}
         proto, cred_type, _ = normalize_protocol_info(ib.get("type"), shortname, first_user)
-        admin_cred = first_user.get(cred_type) or first_user.get("uuid") or first_user.get("password") or ""
+        admin_cred = first_user.get(cred_type) or first_user.get("uuid") or first_user.get("password") or (saved or {}).get("credential", "")
         extra_fields = {k: v for k, v in first_user.items() if k not in ("name", "uuid", "password")}
-        admin_accounts[fname] = {
+        new_accounts[fname] = {
             "protocol": proto,
             "port": port,
             "cred_type": cred_type,
@@ -1054,10 +856,9 @@ def ensure_admin_accounts_fast():
             "extra": extra_fields,
             "default_url": (saved or {}).get("default_url", ""),
         }
-        changed = True
-    if changed:
-        save_json_file(ADMIN_ACCOUNTS_FILE, admin_accounts)
-    return admin_accounts
+    if new_accounts != old_accounts:
+        save_json_file(ADMIN_ACCOUNTS_FILE, new_accounts)
+    return new_accounts
 
 
 def sync_users_to_singbox(payload_data, cfg=None, async_reload=False):
@@ -2664,7 +2465,7 @@ show_status_table() {
     if (( proto_count == 0 )); then
         echo -e "${YELLOW}未检测到任何 sing-box 节点配置，请先运行 sb add 添加节点。${NC}"
     else
-        echo "${disc_json}" | jq -r '.protocols[] | "  • [\(.tag)] 配置文件: \(.config_name) | 外部端口: \(.port) | 凭据类型: \(.cred_type)\n    默认链接: \(.default_url)" + (if (.decoded_summary // "") != "" then "\n    解析详情: " + .decoded_summary else "" end)'
+        echo "${disc_json}" | jq -r '.protocols[] | "  • [\(.tag)] 配置文件: \(.config_name) | 端口: \(.port) | 凭据类型: \(.cred_type)\n    默认链接: \(.default_url)"'
     fi
 
     echo -e "\n${BOLD}${CYAN}================ 当前在席合租用户列表 (面板同步) ================${NC}"
@@ -3071,14 +2872,14 @@ __EOF_SB_ROTATOR_CORE__
 main() {
     check_root
     echo -e "\n${BOLD}${CYAN}=================================================================${NC}"
-    echo -e "${BOLD}   233boy/sing-box 面板动态同步 & Clash API 多IP/动态限速脚本 v3.1.4${NC}"
+    echo -e "${BOLD}   233boy/sing-box 面板动态同步 & Clash API 多IP/动态限速脚本 v3.1.5${NC}"
     echo -e "${BOLD}${CYAN}=================================================================${NC}"
 
     if [[ -x "${INSTALL_BIN}" && -f "${INSTALL_DIR}/config.env" && "${1:-}" == "" ]]; then
         echo -e "${GREEN}检测到本机已安装旧版或现有版本，请选择操作：${NC}"
-        echo -e "  ${GREEN}1)${NC} 升级核心与守护进程至 v3.1.4 并打开管理面板 (保留现有配置)"
-        echo -e "  ${GREEN}2)${NC} 升级核心与守护进程至 v3.1.4 并立即上报协议同步用户 (--register)"
-        echo -e "  ${GREEN}3)${NC} 升级/重装至 v3.1.4 并重新运行配置向导 (--config)"
+        echo -e "  ${GREEN}1)${NC} 升级核心与守护进程至 v3.1.5 并打开管理面板 (保留现有配置)"
+        echo -e "  ${GREEN}2)${NC} 升级核心与守护进程至 v3.1.5 并立即上报协议同步用户 (--register)"
+        echo -e "  ${GREEN}3)${NC} 升级/重装至 v3.1.5 并重新运行配置向导 (--config)"
         echo -e "  ${RED}4)${NC} 一键卸载"
         echo -e "  ${GREEN}0)${NC} 退出"
         local exist_opt=""
@@ -3105,7 +2906,7 @@ main() {
 
     check_dependencies
     deploy_core_script
-    echo -e "${GREEN}[成功] 核心程序 v3.1.4 已安装至 ${INSTALL_BIN} (快捷命令: sbr)${NC}"
+    echo -e "${GREEN}[成功] 核心程序 v3.1.5 已安装至 ${INSTALL_BIN} (快捷命令: sbr)${NC}"
 
     "${INSTALL_BIN}" --config
 
@@ -3117,7 +2918,7 @@ main() {
     fi
 
     echo -e "\n${BOLD}${GREEN}=================================================================${NC}"
-    echo -e "${BOLD}${GREEN} 🎉 v3.1.4 部署完成！随时输入 ${YELLOW}sbr${GREEN} 即可修改限速参数与查看限速生效状态${NC}"
+    echo -e "${BOLD}${GREEN} 🎉 v3.1.5 部署完成！随时输入 ${YELLOW}sbr${GREEN} 即可修改限速参数与查看限速生效状态${NC}"
     echo -e "${BOLD}${GREEN}=================================================================${NC}"
 }
 
