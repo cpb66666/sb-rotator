@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# install.sh - 233boy/sing-box 面板动态合租同步 & Clash API 多IP/动态流量共享限速 一键安装脚本 (v3.1.5)
+# install.sh - 233boy/sing-box 面板动态合租同步 & Clash API 多IP/动态流量共享限速 一键安装脚本 (v3.1.6)
 # 使用方式:
 #   bash <(curl -fsSL https://raw.githubusercontent.com/cpb66666/zidonghuanmi/main/install.sh)
 # ==============================================================================
@@ -70,7 +70,7 @@ deploy_core_script() {
     cat > "${INSTALL_BIN}" <<'__EOF_SB_ROTATOR_CORE__'
 #!/usr/bin/env bash
 # ==============================================================================
-# sb-rotator.sh - 233boy/sing-box 面板动态合租同步 & Clash API 多IP/动态流量限速系统 (v3.1.5)
+# sb-rotator.sh - 233boy/sing-box 面板动态合租同步 & Clash API 多IP/动态流量限速系统 (v3.1.6)
 # 核心能力:
 #   1. 自动扫描 /etc/sing-box/conf/*.json，提取管理员默认链接并通过 POST /api/v1/server/register 上报注册
 #   2. 同步响应 & Push 回调监听 (POST /api/v1/sync): 按协议 cred_type (uuid/password) 动态注入/移除合租用户，保留管理员默认账号
@@ -84,7 +84,7 @@ deploy_core_script() {
 set -o pipefail
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-VERSION="3.1.5"
+VERSION="3.1.6"
 INSTALL_DIR="${INSTALL_DIR:-/etc/sb-rotator}"
 CONFIG_FILE="${CONFIG_FILE:-${INSTALL_DIR}/config.env}"
 ADMIN_ACCOUNTS_FILE="${ADMIN_ACCOUNTS_FILE:-${INSTALL_DIR}/admin_accounts.json}"
@@ -231,7 +231,7 @@ load_config() {
 save_config() {
     ensure_dirs
     cat > "${CONFIG_FILE}" <<EOF
-# sb-rotator v3.1.5 配置文件 (面板同步 + Clash API 多IP与动态流量限速)
+# sb-rotator v3.1.6 配置文件 (面板同步 + Clash API 多IP与动态流量限速)
 PANEL_URL="${PANEL_URL}"
 API_KEY="${API_KEY}"
 SERVER_ID="${SERVER_ID:-1}"
@@ -301,7 +301,7 @@ write_python_daemon() {
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-sb_agent_daemon.py - 233boy/sing-box 节点注册、Push 同步回调与 Clash API 多IP/动态流量限速守护进程 (v3.1.5)
+sb_agent_daemon.py - 233boy/sing-box 节点注册、Push 同步回调与 Clash API 多IP/动态流量限速守护进程 (v3.1.6)
 """
 
 import os
@@ -314,6 +314,7 @@ import shlex
 import socket
 import base64
 import hashlib
+import ipaddress
 import logging
 import threading
 import subprocess
@@ -333,7 +334,7 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
         self.server_name = "sb-agent"
         self.server_port = self.server_address[1]
 
-DAEMON_VERSION = "3.1.5"
+DAEMON_VERSION = "3.1.6"
 INSTALL_DIR = os.environ.get("INSTALL_DIR", "/etc/sb-rotator")
 CONFIG_FILE = os.environ.get("CONFIG_FILE", os.path.join(INSTALL_DIR, "config.env"))
 ADMIN_ACCOUNTS_FILE = os.environ.get("ADMIN_ACCOUNTS_FILE", os.path.join(INSTALL_DIR, "admin_accounts.json"))
@@ -479,7 +480,7 @@ def get_server_ip():
     m = re.search(r"((?:\d{1,3}\.){3}\d{1,3})", out)
     if m:
         return m.group(1)
-    for url in ("https://icanhazip.com", "https://api.ipify.org"):
+    for url in ("https://4.icanhazip.com", "https://api4.ipify.org", "https://icanhazip.com"):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "curl/8.0"})
             with urllib.request.urlopen(req, timeout=4) as resp:
@@ -496,6 +497,103 @@ def get_server_ip():
     except Exception:
         pass
     return "127.0.0.1"
+
+
+def _is_public_ipv6(addr_str):
+    if not addr_str:
+        return False
+    addr_str = addr_str.strip().strip("[]").split("%")[0].split("/")[0]
+    try:
+        ip_obj = ipaddress.ip_address(addr_str)
+        return isinstance(ip_obj, ipaddress.IPv6Address) and ip_obj.is_global
+    except Exception:
+        return False
+
+
+def get_server_ipv6():
+    """
+    自动探查本机是否具备公网 IPv6 地址 (排除回环 ::1、链路本地 fe80:: 及内网 ULA fc00::/7)。
+    若无公网 IPv6 则返回空字符串 ""。
+    """
+    env_v6 = os.environ.get("SERVER_IPV6", "").strip()
+    if _is_public_ipv6(env_v6):
+        return str(ipaddress.ip_address(env_v6.strip("[]")))
+
+    # 1. 通过内核 IPv6 路由表快速探查默认出站公网 IPv6
+    for target in ("2606:4700:4700::1111", "2001:4860:4860::8888"):
+        try:
+            out = subprocess.check_output(["ip", "-6", "route", "get", target], stderr=subprocess.DEVNULL, text=True, timeout=2)
+            m = re.search(r"\bsrc\s+([0-9a-fA-F:]+)", out)
+            if m and _is_public_ipv6(m.group(1)):
+                return str(ipaddress.ip_address(m.group(1)))
+        except Exception:
+            pass
+
+    # 2. 通过本机网卡 global scope IPv6 地址探查
+    try:
+        out = subprocess.check_output(["ip", "-6", "-o", "addr", "show", "scope", "global"], stderr=subprocess.DEVNULL, text=True, timeout=2)
+        for m in re.finditer(r"\binet6\s+([0-9a-fA-F:]+)/\d+", out):
+            cand = m.group(1)
+            if _is_public_ipv6(cand):
+                return str(ipaddress.ip_address(cand))
+    except Exception:
+        pass
+
+    # 3. 兜底通过公网 IPv6 API 探查
+    for url in ("https://6.icanhazip.com", "https://api6.ipify.org"):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "curl/8.0"})
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                ip = resp.read().decode("utf-8", errors="ignore").strip()
+                if _is_public_ipv6(ip):
+                    return str(ipaddress.ip_address(ip))
+        except Exception:
+            pass
+
+    return ""
+
+
+def convert_url_to_ipv6(default_url, srv_ipv6):
+    """
+    保持原 IPv4 链接不变，将链接中的连接地址替换为 [IPv6] 生成对应的 IPv6 节点链接。
+    同时兼容 URI 格式 (vless/hy2/trojan/anytls/tuic/ss 等) 与 vmess:// Base64 JSON 格式。
+    """
+    if not default_url or not srv_ipv6:
+        return ""
+    clean_v6 = srv_ipv6.strip().strip("[]")
+
+    # 1. 处理 vmess:// Base64 JSON 链接
+    if default_url.lower().startswith("vmess://"):
+        b64_part = default_url[8:].strip()
+        pad = (-len(b64_part)) % 4
+        try:
+            raw = base64.b64decode(b64_part + ("=" * pad)).decode("utf-8", errors="ignore")
+            obj = json.loads(raw)
+            if isinstance(obj, dict):
+                obj["add"] = clean_v6
+                ps = str(obj.get("ps") or "vmess")
+                if not ps.lower().endswith("-ipv6"):
+                    obj["ps"] = f"{ps}-IPv6"
+                new_raw = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+                new_b64 = base64.b64encode(new_raw.encode("utf-8")).decode("ascii")
+                return f"vmess://{new_b64}"
+        except Exception:
+            pass
+
+    # 2. 处理标准 URI 格式: proto://cred@host:port?params#remark
+    v6_url = re.sub(
+        r"@(?:\[[0-9a-fA-F:]+\]|[^:@/?#]+):(\d+)",
+        rf"@[{clean_v6}]:\1",
+        default_url,
+        count=1,
+    )
+    if "#" in v6_url:
+        base_part, frag = v6_url.split("#", 1)
+        if not frag.lower().endswith("-ipv6"):
+            v6_url = f"{base_part}#{frag}-IPv6"
+    else:
+        v6_url = f"{v6_url}#IPv6"
+    return v6_url
 
 
 def detect_default_iface():
@@ -619,6 +717,7 @@ def discover_and_get_default_protocols():
 
     files = sorted([f for f in os.listdir(SB_CONF_DIR) if f.endswith(".json")])
     srv_ip = get_server_ip()
+    srv_ipv6 = get_server_ipv6()
     new_admin_accounts = {}
     protocols_list = []
     default_links = []
@@ -692,6 +791,12 @@ def discover_and_get_default_protocols():
             except Exception:
                 pass
 
+        # 确保基础链接使用 IPv4 (防止双栈机器上 sb url 偶发直接输出 IPv6 导致原 IPv4 链接丢失)
+        if srv_ip and srv_ip != "127.0.0.1" and not default_url.lower().startswith("vmess://"):
+            default_url = re.sub(r"@\[[0-9a-fA-F:]+\]:(\d+)", rf"@{srv_ip}:\1", default_url, count=1)
+
+        ipv6_url = convert_url_to_ipv6(default_url, srv_ipv6) if srv_ipv6 else ""
+
         new_admin_accounts[fname] = {
             "protocol": proto,
             "port": port,
@@ -699,8 +804,10 @@ def discover_and_get_default_protocols():
             "credential": admin_cred,
             "extra": extra_fields,
             "default_url": default_url,
+            "ipv6_url": ipv6_url,
         }
 
+        # 1) 保持原有 IPv4 链接与协议项完全不变
         default_links.append(default_url)
         protocols_list.append({
             "protocol": proto,
@@ -708,8 +815,23 @@ def discover_and_get_default_protocols():
             "tag": tag,
             "cred_type": cred_type,
             "default_url": default_url,
+            "ipv6_url": ipv6_url,
             "config_name": fname,
+            "ip_version": "ipv4",
         })
+
+        # 2) 若检测到本机有公网 IPv6，额外将替换成 IPv6 的链接一同加入上报列表
+        if ipv6_url:
+            default_links.append(ipv6_url)
+            protocols_list.append({
+                "protocol": proto,
+                "port": port,
+                "tag": f"{tag}-IPv6",
+                "cred_type": cred_type,
+                "default_url": ipv6_url,
+                "config_name": fname,
+                "ip_version": "ipv6",
+            })
 
     save_json_file(ADMIN_ACCOUNTS_FILE, new_admin_accounts)
     return default_links, protocols_list
@@ -2295,7 +2417,12 @@ if __name__ == "__main__":
         register_with_panel(dry_run=True)
     elif cmd == "discover":
         links, protos = discover_and_get_default_protocols()
-        print(json.dumps({"default_links": links, "protocols": protos}, ensure_ascii=False, indent=2))
+        print(json.dumps({
+            "server_ipv4": get_server_ip(),
+            "server_ipv6": get_server_ipv6(),
+            "default_links": links,
+            "protocols": protos,
+        }, ensure_ascii=False, indent=2))
     elif cmd == "sync-file" and len(sys.argv) > 2:
         data = load_json_file(sys.argv[2], {})
         ok, msg, _ = sync_users_to_singbox(data)
@@ -2459,8 +2586,17 @@ show_status_table() {
     echo -e "\n${BOLD}${CYAN}================ 本机 sing-box 协议列表与默认分享链接 ================${NC}"
     local disc_json
     disc_json="$(python3 "${DAEMON_SCRIPT}" discover 2>/dev/null || echo '{"default_links":[],"protocols":[]}')"
-    local proto_count
+    local srv_v4 srv_v6 proto_count
+    srv_v4="$(echo "${disc_json}" | jq -r '.server_ipv4 // "-"' 2>/dev/null || echo "-")"
+    srv_v6="$(echo "${disc_json}" | jq -r '.server_ipv6 // ""' 2>/dev/null || echo "")"
     proto_count="$(echo "${disc_json}" | jq '.protocols | length' 2>/dev/null || echo 0)"
+
+    if [[ -n "${srv_v6}" ]]; then
+        echo -e "  本机公网 IPv4: ${GREEN}${srv_v4}${NC} | 本机公网 IPv6: ${GREEN}${srv_v6}${NC} ${CYAN}(已开启 IPv4 + IPv6 双栈链接上报)${NC}"
+    else
+        echo -e "  本机公网 IPv4: ${GREEN}${srv_v4}${NC} | 本机公网 IPv6: ${YELLOW}未检测到公网 IPv6 (仅上报 IPv4 链接)${NC}"
+    fi
+    echo "--------------------------------------------------------------------------------"
 
     if (( proto_count == 0 )); then
         echo -e "${YELLOW}未检测到任何 sing-box 节点配置，请先运行 sb add 添加节点。${NC}"
@@ -2872,14 +3008,14 @@ __EOF_SB_ROTATOR_CORE__
 main() {
     check_root
     echo -e "\n${BOLD}${CYAN}=================================================================${NC}"
-    echo -e "${BOLD}   233boy/sing-box 面板动态同步 & Clash API 多IP/动态限速脚本 v3.1.5${NC}"
+    echo -e "${BOLD}   233boy/sing-box 面板动态同步 & Clash API 多IP/动态限速脚本 v3.1.6${NC}"
     echo -e "${BOLD}${CYAN}=================================================================${NC}"
 
     if [[ -x "${INSTALL_BIN}" && -f "${INSTALL_DIR}/config.env" && "${1:-}" == "" ]]; then
         echo -e "${GREEN}检测到本机已安装旧版或现有版本，请选择操作：${NC}"
-        echo -e "  ${GREEN}1)${NC} 升级核心与守护进程至 v3.1.5 并打开管理面板 (保留现有配置)"
-        echo -e "  ${GREEN}2)${NC} 升级核心与守护进程至 v3.1.5 并立即上报协议同步用户 (--register)"
-        echo -e "  ${GREEN}3)${NC} 升级/重装至 v3.1.5 并重新运行配置向导 (--config)"
+        echo -e "  ${GREEN}1)${NC} 升级核心与守护进程至 v3.1.6 并打开管理面板 (保留现有配置)"
+        echo -e "  ${GREEN}2)${NC} 升级核心与守护进程至 v3.1.6 并立即上报协议同步用户 (--register)"
+        echo -e "  ${GREEN}3)${NC} 升级/重装至 v3.1.6 并重新运行配置向导 (--config)"
         echo -e "  ${RED}4)${NC} 一键卸载"
         echo -e "  ${GREEN}0)${NC} 退出"
         local exist_opt=""
@@ -2906,7 +3042,7 @@ main() {
 
     check_dependencies
     deploy_core_script
-    echo -e "${GREEN}[成功] 核心程序 v3.1.5 已安装至 ${INSTALL_BIN} (快捷命令: sbr)${NC}"
+    echo -e "${GREEN}[成功] 核心程序 v3.1.6 已安装至 ${INSTALL_BIN} (快捷命令: sbr)${NC}"
 
     "${INSTALL_BIN}" --config
 
@@ -2918,7 +3054,7 @@ main() {
     fi
 
     echo -e "\n${BOLD}${GREEN}=================================================================${NC}"
-    echo -e "${BOLD}${GREEN} 🎉 v3.1.5 部署完成！随时输入 ${YELLOW}sbr${GREEN} 即可修改限速参数与查看限速生效状态${NC}"
+    echo -e "${BOLD}${GREEN} 🎉 v3.1.6 部署完成！随时输入 ${YELLOW}sbr${GREEN} 即可修改限速参数与查看限速生效状态${NC}"
     echo -e "${BOLD}${GREEN}=================================================================${NC}"
 }
 
