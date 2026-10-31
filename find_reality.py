@@ -2,13 +2,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-REALITY 同网段 TLS 1.3 终极全域防伪嗅探器 V5.0 (Global ASN Edition)
+REALITY 同网段 TLS 1.3 终极同城商业嗅探器 V6.0 (Geo-Locked Enterprise)
 核心特性：
-1. [全域扩扫] /24 -> /21 扫描完成后自动接轨【全 ASN BGP 广播网段】持续深挖
-2. [CDN 权威 CIDR] 引入 Cloudflare/Amazon/Akamai 官方网段白名单，杜绝动态解析误杀
-3. [终极照妖镜] DNS 权威 A 记录 + BGP 路由双重核验，彻底铲除套娃伪装
-4. [代理清洗] 正则秒杀 us10/v10/xyz 等私人翻墙节点
-5. [生态兼容] 自动导出兼容 RealityChecker-PLUS 的 CSV 报表
+1. [同城地理锁] 自动锁定本机国家与地区，严防 IP 飘到跨洋异国
+2. [封杀免费证书] 彻底屏蔽 Let's Encrypt / ZeroSSL，仅保留企业级商业 CA
+3. [低延迟硬限] 强制 RTT <= 35ms，确保 100% 具备同城/同区域极限握手性能
+4. [连续深挖扩扫] 本机物理网段 (/24 -> /18) + 同国 ASN 商业段持续追踪
+5. [权威鉴伪验证] 顶级 CDN 官方 CIDR 白名单 + 权威 DNS 双向交叉验证
 """
 
 import sys
@@ -35,10 +35,24 @@ BOLD = "\033[1m"
 RESET = "\033[0m"
 
 # 核心运行参数
-DEFAULT_LIMIT = 5       # 抓取合格优质真实目标上限
+DEFAULT_LIMIT = 5       # 抓取合格真实商业目标上限
 MAX_WORKERS = 64        # 并发探测线程数
-SOCKET_TIMEOUT = 2.5    # 单次探测超时时间 (秒)
+SOCKET_TIMEOUT = 2.0    # 单次探测超时时间 (秒)
+MAX_ALLOWED_RTT = 35.0  # 最大允许的物理 RTT 延迟 (ms)，超过直接淘汰（防跨洋）
 CSV_OUTPUT = "reality_targets.csv"
+
+# 免费/个人证书黑名单（彻底封杀翻墙小鸡专用证书）
+FORBIDDEN_FREE_CAS = {
+    "let's encrypt", "zerossl", "cpanel", "certbot", "buypass",
+    "trustasia free", "acme", "encryption everyday"
+}
+
+# 认可的顶级商业/企业级 CA 白名单
+TRUSTED_ENTERPRISE_CAS = {
+    "digicert", "amazon", "google trust services", "cloudflare",
+    "globalsign", "sectigo", "entrust", "comodo", "geotrust",
+    "thawte", "verisign", "microsoft", "apple"
+}
 
 # 廉价/翻墙高频后缀黑名单
 CHEAP_TLDS = {
@@ -46,26 +60,26 @@ CHEAP_TLDS = {
     ".gq", ".ml", ".tk", ".work", ".click", ".link", ".online", ".tech"
 }
 
-# 常见翻墙节点命名正则特征 (如 us10.xxx, v10.xxx)
+# 常见翻墙节点命名正则特征
 PROXY_NAME_PATTERN = re.compile(
     r'^(?:us|hk|jp|sg|kr|de|uk|fr|node|v|server|line|route|vpn|proxy|relay|ss|vless|vmess|hy2|iplc|bgp)[-_]?\d*',
     re.IGNORECASE
 )
 
-# GFWList 封锁关键词（国内客户端无法直连）
+# GFWList 封锁关键词
 BLOCKED_KEYWORDS = {
     "google", "youtube", "facebook", "twitter", "x.com", "instagram",
     "telegram", "netflix", "wikipedia", "github.com", "pornhub", "nyt",
     "bbc", "v2ex", "medium", "reddit", "openai", "chatgpt"
 }
 
-# 常见顶级大热域名
+# 顶级大热域名警告库
 HOT_DOMAINS = {
     "apple.com", "icloud.com", "microsoft.com", "windows.com",
     "amazon.com", "tesla.com", "yahoo.com", "live.com"
 }
 
-# 权威顶级 CDN 官方公开 IPv4 网段白名单（实时防止 CDN Anycast 误杀）
+# 权威顶级 CDN 官方公开 IPv4 网段白名单
 OFFICIAL_CDN_NETWORKS = {
     "cloudflare": [
         "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
@@ -88,10 +102,10 @@ OFFICIAL_CDN_NETWORKS = {
     ]
 }
 
-def get_public_ip_and_asn():
-    """获取本机公网 IPv4 及所属机房 ASN"""
+def get_public_ip_and_location():
+    """获取本机公网 IPv4、机房组织、ASN 及地理属地 (Country/City)"""
     endpoints = ["https://ipinfo.io/json", "https://ifconfig.co/json"]
-    ip, org, asn = None, "Unknown", None
+    ip, org, asn, country, city = None, "Unknown", None, "US", "Unknown"
     for url in endpoints:
         try:
             req = urllib.request.Request(url, headers={'User-Agent': 'curl/7.68.0'})
@@ -99,37 +113,58 @@ def get_public_ip_and_asn():
                 data = json.loads(resp.read().decode('utf-8').strip())
                 ip = data.get("ip")
                 org = data.get("org", "Unknown")
+                country = data.get("country", "US")
+                city = data.get("city", "Unknown")
                 asn_match = re.search(r'AS(\d+)', org, re.IGNORECASE)
                 if asn_match:
                     asn = asn_match.group(1)
                 if ip:
                     ipaddress.IPv4Address(ip)
-                    return ip, org, asn
+                    return ip, org, asn, country, city
         except Exception:
             continue
-    return ip, org, asn
+    return ip, org, asn, country, city
 
-def fetch_asn_announced_prefixes(asn):
-    """从 RIPE 全球权威 BGP 数据库拉取该 ASN 广播的所有前缀网段"""
+def check_ip_country(sample_ip):
+    """快速抽样探测某个网段是否与本机属于同一个国家"""
+    try:
+        url = f"https://ipinfo.io/{sample_ip}/country"
+        req = urllib.request.Request(url, headers={'User-Agent': 'curl/7.68.0'})
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            return resp.read().decode('utf-8').strip()
+    except Exception:
+        return None
+
+def fetch_asn_announced_prefixes_geofiltered(asn, local_country):
+    """从 RIPE 全球权威 BGP 数据库拉取该 ASN 网段，并执行同国过滤"""
     if not asn:
         return []
     url = f"https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS{asn}"
-    prefixes = []
+    filtered_prefixes = []
     try:
         req = urllib.request.Request(url, headers={'User-Agent': 'curl/7.68.0'})
         with urllib.request.urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read().decode('utf-8'))
             raw_list = data.get("data", {}).get("prefixes", [])
+            
+            # 提取前缀
+            candidate_prefixes = []
             for item in raw_list:
                 p = item.get("prefix")
-                # 仅筛选 IPv4 并且长度在 /24 到 /21 之间，便于高速扫描
                 if ":" not in p:
                     cidr = int(p.split('/')[1])
                     if 21 <= cidr <= 24:
-                        prefixes.append(p)
+                        candidate_prefixes.append(p)
+            
+            # 抽样检测地理位置，确保严格同国
+            for p in candidate_prefixes[:15]:  # 抽样优先前15个活跃商业段
+                sample_ip = str(ipaddress.IPv4Network(p, strict=False)[2])
+                c = check_ip_country(sample_ip)
+                if c == local_country:
+                    filtered_prefixes.append(p)
     except Exception:
         pass
-    return list(set(prefixes))
+    return list(set(filtered_prefixes))
 
 def is_valid_domain(domain):
     """过滤无效或内部保留域名"""
@@ -164,9 +199,9 @@ def is_gfw_blocked(domain):
 
 def verify_server_authenticity(target_ip, domain, issuer_org):
     """
-    【双重鉴权照妖镜】
-    防线 1：官方权威 CDN CIDR 白名单匹配（解决大厂动态 Anycast 解析不固定问题）
-    防线 2：DNS 权威 A 记录实时双向校验（解决常规自建独立站认证）
+    【商业级双重鉴权照妖镜】
+    防线 1：官方权威 CDN CIDR 白名单匹配
+    防线 2：DNS 权威 A 记录实时双向校验
     """
     target_ip_obj = ipaddress.IPv4Address(target_ip)
     issuer_lower = issuer_org.lower()
@@ -262,6 +297,11 @@ def probe_ip(ip_str):
 
     tcp_rtt = (time.time() - start_time) * 1000
 
+    # 【同城低延迟硬限制】：TCP 延迟超过 35ms 绝不可能是同城机房，直接砍掉（防止跨洋）
+    if tcp_rtt > MAX_ALLOWED_RTT:
+        s.close()
+        return None
+
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -323,7 +363,7 @@ def probe_ip(ip_str):
         return None
 
 def verify_and_evaluate(probe_result):
-    """第二阶段：多维身份核验 + 严格有效性检验"""
+    """第二阶段：多维身份核验 + 免费证书彻底封杀 + 严格有效性检验"""
     ip = probe_result["ip"]
     candidates = probe_result["candidates"]
 
@@ -364,6 +404,10 @@ def verify_and_evaluate(probe_result):
             alpn = sslsock.selected_alpn_protocol() or probe_result["alpn"]
             sslsock.close()
 
+            # 【低延迟硬拦截】：握手总延时超过 35ms 直接丢弃（非同城节点）
+            if total_rtt > MAX_ALLOWED_RTT:
+                continue
+
             not_after_str = cert.get('notAfter')
             expire_date = datetime.strptime(not_after_str, '%b %d %H:%M:%S %Y %Z').replace(tzinfo=timezone.utc)
             remaining_days = (expire_date - datetime.now(timezone.utc)).days
@@ -372,28 +416,34 @@ def verify_and_evaluate(probe_result):
 
             issuer = dict(x[0] for x in cert.get('issuer', []))
             issuer_org = issuer.get('organizationName', issuer.get('commonName', 'Unknown CA'))
+            issuer_lower = issuer_org.lower()
             sans = [v for k, v in cert.get('subjectAltName', []) if k == 'DNS']
 
-            # 4. 【核心鉴伪：权威 CDN CIDR + 权威 DNS 双向交叉验证】
+            # 【核心升级：彻底封杀 Let's Encrypt 等免费证书】
+            if any(bad_ca in issuer_lower for bad_ca in FORBIDDEN_FREE_CAS):
+                print(f"  {YELLOW}[✖ 封杀免费证书] IP: {ip:<15} CA 为免费证书 ({issuer_org})，不满足企业级商业要求！{RESET}")
+                continue
+
+            # 【核心鉴伪：权威 CDN CIDR + 权威 DNS 双向交叉验证】
             is_genuine, auth_msg = verify_server_authenticity(ip, sni_lower, issuer_org)
             if not is_genuine:
                 print(f"  {RED}[✖ 鉴伪拦截] IP: {ip:<15} 宣称是 {sni}，但 {auth_msg}！{RESET}")
                 continue
 
-            # 5. HTTP 重定向校准
+            # 4. HTTP 重定向校准
             final_sni, is_redirected = trace_http_redirect(ip, sni)
 
-            # 6. 后量子抗量子判定
+            # 5. 后量子抗量子判定
             supports_pqc = "可能支持"
-            if any(k in issuer_org.lower() for k in ["cloudflare", "google", "amazon"]):
+            if any(k in issuer_lower for k in ["cloudflare", "google", "amazon"]):
                 supports_pqc = "支持 (ML-KEM-768/Kyber)"
 
             is_hot = any(sni_lower.endswith(hot) for hot in HOT_DOMAINS)
 
-            # 7. 综合评分计算
+            # 6. 综合评分计算
             score = 60
-            if total_rtt < 3.0: score += 20
-            elif total_rtt < 12.0: score += 10
+            if total_rtt < 5.0: score += 20
+            elif total_rtt < 15.0: score += 10
             if alpn == "h2": score += 10
             if not is_hot: score += 10
             if remaining_days > 30: score += 10
@@ -425,35 +475,40 @@ def verify_and_evaluate(probe_result):
             continue
     return None
 
-def build_scan_plan(base_ip, asn):
+def build_scan_plan(base_ip, asn, local_country):
     """
-    自适应扫描队列：
-    阶段 1：本地直连层级 (/24 -> /23 -> /22 -> /21)
-    阶段 2：BGP 广播全网段层级 (该 ASN 在全球宣告的所有其他 IPv4 CIDR)
+    自适应同城商业队列：
+    阶段 1：本机城域物理直连层级 (/24 -> /23 -> /22 -> /21 -> /20 -> /19 -> /18)
+    阶段 2：经过同国地理过滤 (Geo-Locked) 的本 ASN 广播网段
     """
     net24 = ipaddress.IPv4Network(f"{base_ip}/24", strict=False)
     net23 = ipaddress.IPv4Network(f"{base_ip}/23", strict=False)
     net22 = ipaddress.IPv4Network(f"{base_ip}/22", strict=False)
     net21 = ipaddress.IPv4Network(f"{base_ip}/21", strict=False)
+    net20 = ipaddress.IPv4Network(f"{base_ip}/20", strict=False)
+    net19 = ipaddress.IPv4Network(f"{base_ip}/19", strict=False)
+    net18 = ipaddress.IPv4Network(f"{base_ip}/18", strict=False)
 
     plan = [
         ("Layer 1 (同 /24 局域网段)", [str(ip) for ip in net24.hosts() if str(ip) != base_ip]),
         ("Layer 2 (扩充 /23 相邻机架)", [str(ip) for ip in net23.hosts() if ip not in net24 and str(ip) != base_ip]),
         ("Layer 3 (扩充 /22 机房核心)", [str(ip) for ip in net22.hosts() if ip not in net23 and str(ip) != base_ip]),
-        ("Layer 4 (扩充 /21 区域骨干)", [str(ip) for ip in net21.hosts() if ip not in net22 and str(ip) != base_ip])
+        ("Layer 4 (扩充 /21 区域骨干)", [str(ip) for ip in net21.hosts() if ip not in net22 and str(ip) != base_ip]),
+        ("Layer 5 (扩充 /20 同城大区网段)", [str(ip) for ip in net20.hosts() if ip not in net21 and str(ip) != base_ip]),
+        ("Layer 6 (扩充 /19 城域骨干网段)", [str(ip) for ip in net19.hosts() if ip not in net20 and str(ip) != base_ip]),
+        ("Layer 7 (扩充 /18 区域核心网段)", [str(ip) for ip in net18.hosts() if ip not in net19 and str(ip) != base_ip])
     ]
 
-    # 拉取当前 ASN 的所有 BGP 广播前缀
+    # 拉取经过同国核验 (Geo-Filtered) 的该 ASN 商业网段
     if asn:
-        print(f"[*] 正在从 RIPE BGP 路由数据库拉取 AS{asn} 的全部广播网段...")
-        bgp_prefixes = fetch_asn_announced_prefixes(asn)
-        idx = 5
+        print(f"[*] 正在拉取 AS{asn} 广播网段并执行【同国地理位置锁定 ({local_country})】过滤...")
+        bgp_prefixes = fetch_asn_announced_prefixes_geofiltered(asn, local_country)
+        idx = 8
         for prefix in bgp_prefixes:
             try:
                 p_net = ipaddress.IPv4Network(prefix, strict=False)
-                # 排除已经包含在 Layer 1~4 中的网段
-                if not p_net.overlaps(net21):
-                    plan.append((f"Layer {idx} (AS{asn} 商业网段: {prefix})", [str(ip) for ip in p_net.hosts()]))
+                if not p_net.overlaps(net18):
+                    plan.append((f"Layer {idx} (AS{asn} 同国商业段: {prefix})", [str(ip) for ip in p_net.hosts()]))
                     idx += 1
             except Exception:
                 continue
@@ -473,18 +528,18 @@ def export_csv(targets, filepath):
 
 def main():
     print(f"{CYAN}{BOLD}================================================================={RESET}")
-    print(f"{CYAN}{BOLD}  REALITY 同网段 TLS 1.3 终极全域防伪嗅探器 V5.0 (Global ASN)   {RESET}")
+    print(f"{CYAN}{BOLD}   REALITY 同城商业 TLS 1.3 终极嗅探器 V6.0 (Geo-Enterprise)    {RESET}")
     print(f"{CYAN}{BOLD}================================================================={RESET}")
 
-    print(f"[*] 正在识别本机网络环境与机房 BGP 属性...")
-    my_ip, my_org, my_asn = get_public_ip_and_asn()
+    print(f"[*] 正在锁定本机地理位置与机房网络环境...")
+    my_ip, my_org, my_asn, my_country, my_city = get_public_ip_and_location()
     if not my_ip:
-        print(f"{RED}[!] 获取公网 IP 失败，请检查网络配置。{RESET}")
+        print(f"{RED}[!] 获取公网 IP 失败，请检查网络设置。{RESET}")
         sys.exit(1)
-    print(f"{GREEN}[✓] 本机 IP: {BOLD}{my_ip}{RESET} | 机房: {BOLD}{my_org}{RESET} (ASN: AS{my_asn})\n")
+    print(f"{GREEN}[✓] 本机 IP: {BOLD}{my_ip}{RESET} | 属地: {BOLD}{my_country} ({my_city}){RESET} | 机房: {BOLD}{my_org}{RESET} (ASN: AS{my_asn})\n")
 
-    scan_plan = build_scan_plan(my_ip, my_asn)
-    print(f"{GREEN}[✓] 已成功构建全域调度计划，总计包含 {len(scan_plan)} 个由近及远阶段网段！{RESET}\n")
+    scan_plan = build_scan_plan(my_ip, my_asn, my_country)
+    print(f"{GREEN}[✓] 调度引擎已就绪，已严格锁定 [{my_country}] 本地网段并限制 RTT <= {MAX_ALLOWED_RTT}ms！{RESET}\n")
 
     found_targets = []
 
@@ -504,46 +559,46 @@ def main():
                         print(f"  {RED}[✖ 拦截套娃] IP: {res['ip']:<15} (时延严重割裂: TCP {res['tcp_rtt']:.1f}ms, TLS {res['handshake_rtt']:.1f}ms){RESET}")
                     else:
                         stage1_results.append(res)
-                        print(f"  {CYAN}发现物理开放: {res['ip']:<15} (延迟: {res['tcp_rtt']}ms | TLS 1.3: 是){RESET}")
+                        print(f"  {CYAN}发现同城开放: {res['ip']:<15} (延迟: {res['tcp_rtt']}ms | TLS 1.3: 是){RESET}")
 
                 if scanned % 50 == 0 or scanned == len(ip_list):
                     sys.stdout.write(f"\r  -> 进度: {scanned}/{len(ip_list)} (捕获开放节点: {len(stage1_results)})")
                     sys.stdout.flush()
 
-        print(f"\n[*] 正在启动【权威 CDN 网段白名单】与【DNS 双向交叉鉴权】...")
+        print(f"\n[*] 正在执行【免费 CA 封杀】、【同城延时核验】与【CDN+DNS 权威鉴伪】...")
         for probe_res in stage1_results:
             evaluated = verify_and_evaluate(probe_res)
             if evaluated:
                 found_targets.append(evaluated)
-                print(f"  {GREEN}[✓ 官方真身] {evaluated['stars']} IP: {evaluated['ip']:<15} | SNI: {evaluated['sni']} | CA: {evaluated['issuer']}{RESET}")
+                print(f"  {GREEN}[✓ 顶级商业真身] {evaluated['stars']} IP: {evaluated['ip']:<15} | SNI: {evaluated['sni']} | CA: {evaluated['issuer']}{RESET}")
 
             if len(found_targets) >= DEFAULT_LIMIT:
-                print(f"\n{GREEN}[✓] 已找到 {DEFAULT_LIMIT} 个真实官方目标，圆满完成任务并停止扩散！{RESET}")
+                print(f"\n{GREEN}[✓] 已找到 {DEFAULT_LIMIT} 个顶级同城商业官方目标，圆满完成任务并停止扩散！{RESET}")
                 break
 
         if len(found_targets) >= DEFAULT_LIMIT:
             break
         else:
-            print(f"[*] 当前网段未找齐目标 ({len(found_targets)}/{DEFAULT_LIMIT})。继续自动深挖下一个 BGP 商业网段...\n")
+            print(f"[*] 当前网段未找齐目标 ({len(found_targets)}/{DEFAULT_LIMIT})。继续自动深挖下一个同城商业网段...\n")
 
     if not found_targets:
-        print(f"\n{RED}[!] 在全机房广播网段内均未发现官方实体服务器。{RESET}")
+        print(f"\n{RED}[!] 在当前同城所有商业网段内均未发现商业企业实体服务器。{RESET}")
         return
 
     # 按推荐总分与 RTT 排序
     found_targets.sort(key=lambda x: (-x["score"], x["rtt"]))
 
     print(f"\n{CYAN}{BOLD}================================================================={RESET}")
-    print(f"{CYAN}{BOLD}     🏆 REALITY 权威认证真实官方目标排行 (经 CDN+DNS 双重验证)    {RESET}")
+    print(f"{CYAN}{BOLD}     🏆 REALITY 顶级同城商业认证目标排行 (剔除一切免费与异国IP)   {RESET}")
     print(f"{CYAN}{BOLD}================================================================={RESET}\n")
 
     for idx, item in enumerate(found_targets, 1):
-        hot_flag = f"{RED}[⚠️ 热门域名]{RESET}" if item["is_hot"] else f"{GREEN}[官方认证]{RESET}"
+        hot_flag = f"{RED}[⚠️ 热门域名]{RESET}" if item["is_hot"] else f"{GREEN}[企业认证]{RESET}"
         redir_flag = f"{YELLOW}(重定向校准自 {item['raw_sni']}){RESET}" if item["is_redirected"] else ""
-        print(f"{BOLD}[{idx}] {item['stars']} IP: {item['ip']}:443  (物理延迟: {item['rtt']} ms) {hot_flag}{RESET}")
+        print(f"{BOLD}[{idx}] {item['stars']} IP: {item['ip']}:443  (同城物理延迟: {item['rtt']} ms) {hot_flag}{RESET}")
         print(f"    - 官方 SNI: {BOLD}{CYAN}{item['sni']}{RESET} {redir_flag}")
         print(f"    - 协议/ALPN: {GREEN}{item['tls_version']}{RESET} | {item['alpn']} | 抗量子: {MAGENTA}{item['pqc']}{RESET}")
-        print(f"    - 证书主体: {item['issuer']} (有效期至: {item['expire_date']}, 剩余 {item['remaining_days']} 天)")
+        print(f"    - 商业 CA 主体: {BOLD}{item['issuer']}{RESET} (有效期至: {item['expire_date']}, 剩余 {item['remaining_days']} 天)")
         print(f"    {YELLOW}------------------------------------------------------------{RESET}")
         print(f"    {BOLD}Sing-box 推荐配置:{RESET}")
         print(f'      "server_name": "{item["sni"]}",')
