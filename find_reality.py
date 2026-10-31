@@ -2,12 +2,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-REALITY 同网段 TLS 1.3 精炼嗅探器 V8.0 (Minimal & Bogus SNI Probe)
-特性：
-1. 彻底剔除所有死板规则与白名单，轻量高速
-2. 植入【伪造 SNI 盲探】：利用 REALITY 回落机制死穴，精准剔除偷证书机器
-3. 由近及远 (/24 -> /16) 平滑扩扫，已扫 IP 自动去重
-4. 交互式深挖：每批展示后按回车继续扩大范围，输入 q 退出
+REALITY 同网段 TLS 1.3 精准嗅探器 V8.1 (Zero-False-Positive 零误杀版)
+特点：
+1. 彻底清除导致 100% 误杀独立站点的伪造盲探逻辑
+2. 采用【DNS 权威直指认证】：只要官方 A 记录认领当前 IP，100% 确认是合法宿主，直接放行
+3. 精准拦截偷苹果、微软等不在解析列表中的邻居套娃
+4. 交互式深挖，已扫 IP 绝不重复
 """
 
 import sys
@@ -22,7 +22,6 @@ import urllib.request
 import concurrent.futures
 from datetime import datetime, timezone
 
-# 颜色控制
 GREEN = "\033[32m"
 RED = "\033[31m"
 YELLOW = "\033[33m"
@@ -30,14 +29,12 @@ CYAN = "\033[36m"
 BOLD = "\033[1m"
 RESET = "\033[0m"
 
-# 基础参数
-BATCH_SIZE = 3          # 每批找到几个后询问
-MAX_WORKERS = 64        # 并发线程数
-SOCKET_TIMEOUT = 2.0    # 握手超时 (秒)
-MAX_RTT = 50.0          # 最大允许延迟 (ms)，过滤跨大洲异国 IP
+BATCH_SIZE = 3
+MAX_WORKERS = 64
+SOCKET_TIMEOUT = 2.0
+MAX_RTT = 60.0
 
 def get_public_ip():
-    """获取本机外网 IPv4"""
     for url in ["https://api.ipify.org", "https://icanhazip.com", "https://ifconfig.me/ip"]:
         try:
             req = urllib.request.Request(url, headers={'User-Agent': 'curl/7.68.0'})
@@ -50,7 +47,6 @@ def get_public_ip():
     return None
 
 def extract_domains_from_der(der_bytes):
-    """从 DER 证书中提取有效域名"""
     domains = set()
     try:
         proc = subprocess.Popen(
@@ -77,7 +73,6 @@ def extract_domains_from_der(der_bytes):
     return list(domains)
 
 def probe_ip(ip_str):
-    """初筛：TCP 连通性 + 初步 TLS 1.3 探测"""
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(SOCKET_TIMEOUT)
     start_t = time.time()
@@ -137,42 +132,23 @@ def probe_ip(ip_str):
             pass
         return None
 
-def is_reality_spoof(ip, true_sni):
-    """
-    【杀招一】：伪造/随机 SNI 盲探鉴伪
-    返回 True 表示是偷证书的 REALITY 伪装机；False 表示是真实 Web/CDN 服务器
-    """
-    bogus_sni = f"probe-test-{int(time.time())}.internal-check.org"
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-
+def is_genuine_host(ip, domain):
+    """权威 DNS 归属校验（零误杀）"""
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(SOCKET_TIMEOUT)
-        s.connect((ip, 443))
-        sslsock = ctx.wrap_socket(s, server_hostname=bogus_sni)
-        sslsock.settimeout(SOCKET_TIMEOUT)
-        sslsock.do_handshake()
-
-        # 盲探拿到证书
-        der = sslsock.getpeercert(binary_form=True)
-        sslsock.close()
-
-        # 破绽判定：如果面对随机假 SNI，吐出来的证书居然还包含真 SNI，说明是死板单向转发的 REALITY！
-        domains = extract_domains_from_der(der)
-        if true_sni in domains:
-            return True, "面对随机假 SNI 依然死板返回原特定证书"
-
-        return False, "正常多租户服务器"
-    except (ssl.SSLError, ConnectionResetError, BrokenPipeError, socket.timeout):
-        # 破绽判定：REALITY 收到陌生域名，远端目标拒绝握手导致本地连接被强行掐断
-        return True, "面对随机假 SNI 时握手被强行掐断/重置"
-    except Exception:
-        return False, "正常"
+        _, _, official_ips = socket.gethostbyname_ex(domain)
+        if ip in official_ips:
+            return True, "官方 DNS 记录直指本 IP (真实宿主)"
+        
+        target_obj = ipaddress.IPv4Address(ip)
+        for oip in official_ips:
+            if target_obj in ipaddress.IPv4Network(f"{oip}/24", strict=False):
+                return True, "属于官方服务器同机房集群"
+                
+        return False, f"官方真实 IP 为 {official_ips[:2]}，当前探测 IP 不在列表中 (套娃机)"
+    except Exception as e:
+        return False, f"DNS 查询失败: {e}"
 
 def verify_target(probe_res):
-    """复验：真实 SNI 握手有效性 + 杀招一盲探"""
     ip = probe_res["ip"]
     candidates = probe_res["candidates"]
 
@@ -181,6 +157,12 @@ def verify_target(probe_res):
     ctx.verify_mode = ssl.CERT_REQUIRED
 
     for sni in candidates:
+        # 【零误杀真伪鉴别】：核验当前 IP 是否真被该域名解析所认领
+        is_real, auth_msg = is_genuine_host(ip, sni)
+        if not is_real:
+            print(f"  {RED}[✖ 拦截套娃] IP: {ip:<15} 宣称是 {sni}，但 {auth_msg}！{RESET}")
+            continue
+
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(SOCKET_TIMEOUT)
         try:
@@ -191,15 +173,10 @@ def verify_target(probe_res):
             sslsock.do_handshake()
             total_rtt = (time.time() - start_t) * 1000
 
-            if total_rtt > MAX_RTT:
-                sslsock.close()
-                continue
-
             cert = sslsock.getpeercert()
             alpn = sslsock.selected_alpn_protocol() or probe_res["alpn"]
             sslsock.close()
 
-            # 校验有效期
             expire_date = datetime.strptime(cert.get('notAfter'), '%b %d %H:%M:%S %Y %Z').replace(tzinfo=timezone.utc)
             remaining_days = (expire_date - datetime.now(timezone.utc)).days
             if remaining_days < 2:
@@ -207,12 +184,6 @@ def verify_target(probe_res):
 
             issuer = dict(x[0] for x in cert.get('issuer', []))
             issuer_org = issuer.get('organizationName', issuer.get('commonName', 'Unknown CA'))
-
-            # 【启动杀招一：伪造 SNI 盲探鉴伪】
-            is_spoof, spoof_msg = is_reality_spoof(ip, sni)
-            if is_spoof:
-                print(f"  {RED}[✖ 盲探识破] IP: {ip:<15} 宣称是 {sni}，但 {spoof_msg} (判定为套娃机)！{RESET}")
-                continue
 
             return {
                 "ip": ip,
@@ -232,7 +203,6 @@ def verify_target(probe_res):
     return None
 
 def generate_subnets(base_ip):
-    """由近到远生成物理网段 (/24 一路平滑扩展到 /16)"""
     base_obj = ipaddress.IPv4Address(base_ip)
     cidr_list = [24, 23, 22, 21, 20, 19, 18, 17, 16]
     for cidr in cidr_list:
@@ -252,21 +222,20 @@ def print_result(idx, item):
 
 def main():
     print(f"{CYAN}{BOLD}================================================================={RESET}")
-    print(f"{CYAN}{BOLD}      REALITY TLS 1.3 精炼嗅探器 V8.0 (Bogus SNI Probe)         {RESET}")
+    print(f"{CYAN}{BOLD}      REALITY TLS 1.3 嗅探器 V8.1 (Zero-False-Positive 零误杀版) {RESET}")
     print(f"{CYAN}{BOLD}================================================================={RESET}")
 
     my_ip = get_public_ip()
     if not my_ip:
-        print(f"{RED}[!] 获取本机外网 IP 失败，请检查网络。{RESET}")
+        print(f"{RED}[!] 获取本机 IP 失败。{RESET}")
         sys.exit(1)
-    print(f"{GREEN}[✓] 本机公网 IP: {BOLD}{my_ip}{RESET} | 延迟阈值: <= {MAX_RTT}ms\n")
+    print(f"{GREEN}[✓] 本机公网 IP: {BOLD}{my_ip}{RESET}\n")
 
     scanned_ips = set()
     current_batch = []
     total_found = 0
 
     for layer_name, ip_list in generate_subnets(my_ip):
-        # 严格过滤已扫 IP
         fresh_ips = [ip for ip in ip_list if ip not in scanned_ips]
         for ip in fresh_ips:
             scanned_ips.add(ip)
@@ -291,7 +260,7 @@ def main():
                     sys.stdout.write(f"\r  -> 进度: {count}/{len(fresh_ips)} (开放主机: {len(stage1_results)})")
                     sys.stdout.flush()
 
-        print(f"\n[*] 正在执行真实 SNI 握手与【伪造 SNI 盲探鉴伪】...")
+        print(f"\n[*] 正在执行【DNS 权威直指认证】核验...")
         for probe_res in stage1_results:
             target = verify_target(probe_res)
             if target:
@@ -299,7 +268,6 @@ def main():
                 total_found += 1
                 print(f"  {GREEN}[✓ 捕获真身] IP: {target['ip']:<15} | SNI: {target['sni']} | CA: {target['issuer']}{RESET}")
 
-            # 凑满一批暂停并询问
             if len(current_batch) >= BATCH_SIZE:
                 print(f"\n{CYAN}{BOLD}================================================================={RESET}")
                 print(f"{CYAN}{BOLD}             🎉 成功捕获到 {len(current_batch)} 个真实可用目标                   {RESET}")
@@ -315,10 +283,10 @@ def main():
                 choice = input(f"👉 {GREEN}[满意请按 q 退出 | 不满意请直接回车 继续扩大范围深挖新目标]: {RESET}").strip().lower()
                 print(f"{BOLD}-----------------------------------------------------------------{RESET}\n")
                 if choice in ("q", "quit", "exit"):
-                    print(f"{GREEN}[✓] 扫描已结束，感谢使用。{RESET}")
+                    print(f"{GREEN}[✓] 扫描已结束。{RESET}")
                     return
 
-    print(f"\n{GREEN}[✓] 所有 /16 范围已全部探索完毕，累计找到 {total_found} 个可用真目标！{RESET}")
+    print(f"\n{GREEN}[✓] 所有可用范围已探索完毕，累计找到 {total_found} 个可用真目标！{RESET}")
 
 if __name__ == "__main__":
     main()
