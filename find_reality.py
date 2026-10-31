@@ -2,12 +2,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-REALITY 同网段 TLS 1.3 证书自动嗅探与智能评估工具 V2.0
-集成 RealityChecker-PLUS 优秀特性：
-- GFWList 可达性初筛
-- HTTP 重定向最终 SNI 追踪
-- 大热域名降权与 ML-KEM-768 后量子标记
-- 综合星级评分与 CSV 导出
+REALITY 同网段 TLS 1.3 证书智能搜索与防套娃评估工具 V3.0
+核心升级：
+1. [独家] 严防“邻居 REALITY 套娃”：时延不对称算法 + 虚假巨头证书拦截
+2. [防护] GFWList 墙内可达性初筛：剔除国内无法直连的被墙域名
+3. [校准] HTTP 301/302 重定向落地追踪：自动校准为真正的 FinalDomain
+4. [前瞻] X25519MLKEM768 后量子抗量子检测与大热域名风险降权
+5. [生态] 自动导出标准 CSV，兼容 RealityChecker-PLUS
 """
 
 import sys
@@ -32,43 +33,59 @@ MAGENTA = "\033[35m"
 BOLD = "\033[1m"
 RESET = "\033[0m"
 
-# 默认参数
-DEFAULT_LIMIT = 5       # 抓取合格目标数量上限
-MAX_WORKERS = 64        # 并发线程数
-SOCKET_TIMEOUT = 2.5    # 超时时间 (秒)
+# 运行参数
+DEFAULT_LIMIT = 5       # 抓取合格优质目标上限
+MAX_WORKERS = 64        # 并发探测线程数
+SOCKET_TIMEOUT = 2.5    # 单次探测超时时间 (秒)
 CSV_OUTPUT = "reality_targets.csv"
 
-# 常见已被 GFW 封锁的典型域名特征（墙内不可直连）
+# 常见已被 GFW 封锁的典型域名特征（国内客户端无法直连）
 BLOCKED_KEYWORDS = {
     "google", "youtube", "facebook", "twitter", "x.com", "instagram",
     "telegram", "netflix", "wikipedia", "github.com", "pornhub", "nyt",
     "bbc", "v2ex", "medium", "reddit", "openai", "chatgpt"
 }
 
-# 常见顶级大热域名（不建议作为首选，容易被重点审计）
+# 常见顶级大热域名（不建议作为首选，避免集中审查）
 HOT_DOMAINS = {
     "apple.com", "icloud.com", "microsoft.com", "windows.com",
     "amazon.com", "tesla.com", "yahoo.com", "live.com"
 }
 
-def get_public_ip():
-    """获取本机公网 IPv4 地址"""
+# 邻居 REALITY 最喜欢偷的“虚假大厂库”（普通机房 IP 绝不可能拥有其物理证书）
+FAKE_GIANT_TARGETS = {
+    "apple": ["apple.com", "apple.com.cn", "cdn-apple.com"],
+    "microsoft": ["microsoft.com", "azure.com", "live.com"],
+    "tesla": ["tesla.com", "tesla.cn"],
+}
+
+def get_public_ip_and_asn():
+    """获取本机公网 IPv4 及所属机房 ASN 组织"""
     endpoints = [
-        "https://api.ipify.org",
-        "https://icanhazip.com",
-        "https://ifconfig.me/ip",
-        "https://ip.sb"
+        "https://ipinfo.io/json",
+        "https://ifconfig.co/json",
+        "https://api.ipify.org"
     ]
+    ip = None
+    org = "Unknown"
     for url in endpoints:
         try:
             req = urllib.request.Request(url, headers={'User-Agent': 'curl/7.68.0'})
             with urllib.request.urlopen(req, timeout=3) as resp:
-                ip = resp.read().decode('utf-8').strip()
-                ipaddress.IPv4Address(ip)
-                return ip
+                content = resp.read().decode('utf-8').strip()
+                if url.endswith("/json"):
+                    import json
+                    data = json.loads(content)
+                    ip = data.get("ip")
+                    org = data.get("org", "Unknown")
+                else:
+                    ip = content
+                if ip:
+                    ipaddress.IPv4Address(ip)
+                    return ip, org
         except Exception:
             continue
-    return None
+    return ip, org
 
 def is_valid_domain(domain):
     """过滤无效或内部保留域名"""
@@ -83,11 +100,11 @@ def is_valid_domain(domain):
     return bool(re.match(pattern, domain))
 
 def is_gfw_blocked(domain):
-    """GFW 封锁简易快速检测（借鉴 RealityChecker-PLUS）"""
+    """GFW 封锁简易快速检测"""
     domain = domain.lower()
     for kw in BLOCKED_KEYWORDS:
         if kw in domain:
-            return True, f"命中被墙特征词 [{kw}]"
+            return True, f"命中被墙特征 [{kw}]"
     return False, ""
 
 def extract_domains_from_der(der_bytes):
@@ -119,34 +136,22 @@ def extract_domains_from_der(der_bytes):
     return list(domains)
 
 def trace_http_redirect(ip, domain):
-    """
-    HTTP 重定向与落地 SNI 检测（借鉴 RealityChecker-PLUS 的 Redirect 模块）
-    返回：(最终落地域名, 是否发生重定向, HTTP状态码)
-    """
+    """HTTP 301/302 重定向检测，锁定真实生效域名"""
     final_domain = domain
     is_redirected = False
-    status_code = 0
     try:
-        # 强制将域名解析指向目标 IP 进行 HTTP 嗅探
         conn = socket.create_connection((ip, 443), timeout=SOCKET_TIMEOUT)
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
         s = ctx.wrap_socket(conn, server_hostname=domain)
-        
-        # 发送轻量 HEAD 请求
         req = f"HEAD / HTTP/1.1\r\nHost: {domain}\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n"
         s.sendall(req.encode())
         resp = s.recv(1024).decode('utf-8', errors='ignore')
         s.close()
 
-        # 解析状态行
         status_match = re.search(r'HTTP/\d\.\d\s+(\d+)', resp)
-        if status_match:
-            status_code = int(status_match.group(1))
-
-        # 检查 301/302 重定向
-        if status_code in (301, 302, 307, 308):
+        if status_match and int(status_match.group(1)) in (301, 302, 307, 308):
             loc_match = re.search(r'Location:\s*([^\r\n]+)', resp, re.IGNORECASE)
             if loc_match:
                 loc = loc_match.group(1).strip()
@@ -158,10 +163,10 @@ def trace_http_redirect(ip, domain):
                         is_redirected = True
     except Exception:
         pass
-    return final_domain, is_redirected, status_code
+    return final_domain, is_redirected
 
 def probe_ip(ip_str):
-    """第一阶段探测：端口与基本 TLS 1.3 握手"""
+    """第一阶段探测：TCP 端口 + 初步 TLS 握手 + 时延不对称初筛"""
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(SOCKET_TIMEOUT)
     start_time = time.time()
@@ -193,6 +198,12 @@ def probe_ip(ip_str):
             sslsock.close()
             return None
 
+        # 【防套娃算法 1：时延严重不对称拦截】
+        # 同网段 TCP 极快 (<10ms)，但 TLS 却因为中继转发暴增至 60ms 以上
+        if tcp_rtt < 12 and handshake_rtt > 55 and (handshake_rtt / max(tcp_rtt, 0.5)) > 6:
+            sslsock.close()
+            return {"spoof_relay": True, "ip": ip_str, "tcp_rtt": tcp_rtt, "handshake_rtt": handshake_rtt}
+
         der_cert = sslsock.getpeercert(binary_form=True)
         alpn = sslsock.selected_alpn_protocol() or "none"
         sslsock.close()
@@ -213,6 +224,7 @@ def probe_ip(ip_str):
             return None
 
         return {
+            "spoof_relay": False,
             "ip": ip_str,
             "tcp_rtt": round(tcp_rtt, 2),
             "handshake_rtt": round(handshake_rtt, 2),
@@ -227,8 +239,8 @@ def probe_ip(ip_str):
             pass
         return None
 
-def verify_and_evaluate(probe_result):
-    """第二阶段：集成 RealityChecker-PLUS 逻辑的综合评估与打分"""
+def verify_and_evaluate(probe_result, local_org):
+    """第二阶段：防套娃身份核验 + GFWList 过滤 + 综合评分"""
     ip = probe_result["ip"]
     candidates = probe_result["candidates"]
 
@@ -241,12 +253,27 @@ def verify_and_evaluate(probe_result):
         pass
 
     for sni in candidates:
-        # 1. GFWList 过滤
-        blocked, reason = is_gfw_blocked(sni)
+        sni_lower = sni.lower()
+
+        # 1. GFWList 封锁初筛
+        blocked, _ = is_gfw_blocked(sni_lower)
         if blocked:
             continue
 
-        # 2. 握手与证书有效性校验
+        # 2. 【防套娃算法 2：机房身份与证书巨头不匹配拦截】
+        # 如果是普通 VPS 托管机房（非苹果/微软自建 ASN），却出现了苹果/微软的证书，必是邻居偷的！
+        is_spoof_giant = False
+        for giant_name, giant_domains in FAKE_GIANT_TARGETS.items():
+            if any(gd in sni_lower for gd in giant_domains):
+                # 检查 ASN 组织名称，如果不是该大厂官方 ASN，直接判定为邻居套娃
+                if giant_name not in local_org.lower():
+                    is_spoof_giant = True
+                    break
+        if is_spoof_giant:
+            print(f"  {RED}[✖ 拦截套娃] IP: {ip:<15} 证书宣称是 {sni}，但机房为普通 VPS ({local_org})，判定为邻居 REALITY！{RESET}")
+            continue
+
+        # 3. 严格 TLS 握手及证书有效性检验
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(SOCKET_TIMEOUT)
         try:
@@ -271,21 +298,20 @@ def verify_and_evaluate(probe_result):
             issuer_org = issuer.get('organizationName', issuer.get('commonName', 'Unknown CA'))
             sans = [v for k, v in cert.get('subjectAltName', []) if k == 'DNS']
 
-            # 3. HTTP 重定向追踪
-            final_sni, is_redirected, http_code = trace_http_redirect(ip, sni)
+            # 4. HTTP 重定向追踪
+            final_sni, is_redirected = trace_http_redirect(ip, sni)
 
-            # 4. 后量子特征检测（Cloudflare/Google 及已知大厂默认支持）
+            # 5. 后量子抗量子 (ML-KEM-768) 判定
             supports_pqc = "可能支持"
             if any(k in issuer_org.lower() for k in ["cloudflare", "google", "amazon"]):
                 supports_pqc = "支持 (ML-KEM-768/Kyber)"
 
-            # 5. 热门大网站预警判定
-            is_hot = any(sni.endswith(hot) for hot in HOT_DOMAINS)
+            is_hot = any(sni_lower.endswith(hot) for hot in HOT_DOMAINS)
 
-            # 6. 综合评分系统 (100分制)
+            # 6. 综合评分系统 (100 分制)
             score = 50
-            if total_rtt < 2.0: score += 25
-            elif total_rtt < 10.0: score += 15
+            if total_rtt < 3.0: score += 25
+            elif total_rtt < 12.0: score += 15
             if alpn == "h2": score += 15
             if not is_hot: score += 10
             if not is_redirected: score += 10
@@ -325,8 +351,8 @@ def generate_subnets(base_ip):
     net22 = ipaddress.IPv4Network(f"{base_ip}/22", strict=False)
 
     return [
-        ("Layer 1 (同 /24 局域邻居网段)", [str(ip) for ip in net24.hosts() if str(ip) != base_ip]),
-        ("Layer 2 (扩充 /23 相邻机架网段)", [str(ip) for ip in net23.hosts() if ip not in net24 and str(ip) != base_ip]),
+        ("Layer 1 (同 /24 邻近交换机机架)", [str(ip) for ip in net24.hosts() if str(ip) != base_ip]),
+        ("Layer 2 (扩充 /23 相邻机房网段)", [str(ip) for ip in net23.hosts() if ip not in net24 and str(ip) != base_ip]),
         ("Layer 3 (扩充 /22 区域同城网段)", [str(ip) for ip in net22.hosts() if ip not in net23 and str(ip) != base_ip])
     ]
 
@@ -344,15 +370,15 @@ def export_csv(targets, filepath):
 
 def main():
     print(f"{CYAN}{BOLD}================================================================={RESET}")
-    print(f"{CYAN}{BOLD}    REALITY 同网段 TLS 1.3 证书智能搜索评估工具 V2.0 (Plus)     {RESET}")
+    print(f"{CYAN}{BOLD}   REALITY 同网段 TLS 1.3 智能嗅探与防套娃工具 V3.0 (Anti-Spoof) {RESET}")
     print(f"{CYAN}{BOLD}================================================================={RESET}")
 
-    print(f"[*] 正在自动检测本机外网 IPv4 地址...")
-    my_ip = get_public_ip()
+    print(f"[*] 正在识别本机网络环境与机房 ASN 属性...")
+    my_ip, my_org = get_public_ip_and_asn()
     if not my_ip:
-        print(f"{RED}[!] 获取公网 IP 失败，请检查网络设置。{RESET}")
+        print(f"{RED}[!] 获取公网 IP 失败，请检查网络配置。{RESET}")
         sys.exit(1)
-    print(f"{GREEN}[✓] 本机公网 IP: {BOLD}{my_ip}{RESET}\n")
+    print(f"{GREEN}[✓] 本机 IP: {BOLD}{my_ip}{RESET} | 归属机房: {BOLD}{my_org}{RESET}\n")
 
     layers = generate_subnets(my_ip)
     found_targets = []
@@ -369,21 +395,25 @@ def main():
                 scanned += 1
                 res = future.result()
                 if res:
-                    stage1_results.append(res)
-                    print(f"  {CYAN}发现开放主机: {res['ip']:<15} (延迟: {res['tcp_rtt']}ms | TLS 1.3: 是){RESET}")
+                    if res.get("spoof_relay"):
+                        print(f"  {RED}[✖ 拦截套娃] IP: {res['ip']:<15} (TCP: {res['tcp_rtt']:.1f}ms, TLS: {res['handshake_rtt']:.1f}ms - 时延严重割裂！){RESET}")
+                    else:
+                        stage1_results.append(res)
+                        print(f"  {CYAN}发现物理开放: {res['ip']:<15} (延迟: {res['tcp_rtt']}ms | TLS 1.3: 是){RESET}")
+
                 if scanned % 25 == 0 or scanned == len(ip_list):
-                    sys.stdout.write(f"\r  -> 扫描进度: {scanned}/{len(ip_list)} (开放TLS1.3: {len(stage1_results)})")
+                    sys.stdout.write(f"\r  -> 进度: {scanned}/{len(ip_list)} (捕获候选: {len(stage1_results)})")
                     sys.stdout.flush()
 
-        print(f"\n[*] 正在执行 GFWList 过滤、重定向校准与后量子综合评估...")
+        print(f"\n[*] 正在执行套娃识别、GFWList 过滤、重定向校准与综合评估...")
         for probe_res in stage1_results:
-            evaluated = verify_and_evaluate(probe_res)
+            evaluated = verify_and_evaluate(probe_res, my_org)
             if evaluated:
                 found_targets.append(evaluated)
-                print(f"  {GREEN}[✓ 优选合格] {evaluated['stars']} IP: {evaluated['ip']:<15} | SNI: {evaluated['sni']} | CA: {evaluated['issuer']}{RESET}")
+                print(f"  {GREEN}[✓ 真实合格] {evaluated['stars']} IP: {evaluated['ip']:<15} | SNI: {evaluated['sni']} | CA: {evaluated['issuer']}{RESET}")
 
             if len(found_targets) >= DEFAULT_LIMIT:
-                print(f"\n{GREEN}[✓] 已找到 {DEFAULT_LIMIT} 个高分目标，停止向外扩展。{RESET}")
+                print(f"\n{GREEN}[✓] 已找到 {DEFAULT_LIMIT} 个真实优质原生目标，停止向外扩展。{RESET}")
                 break
 
         if len(found_targets) >= DEFAULT_LIMIT:
@@ -392,33 +422,32 @@ def main():
             print(f"[*] 当前网段完成，已有合格目标: {len(found_targets)}/{DEFAULT_LIMIT}。扩展到下一层级...\n")
 
     if not found_targets:
-        print(f"\n{RED}[!] 周边网段未发现符合条件的合格目标。{RESET}")
+        print(f"\n{RED}[!] 周边网段未发现符合条件的真实独立服务器。{RESET}")
         return
 
-    # 按综合评分和 RTT 排序
+    # 按推荐总分与 RTT 排序
     found_targets.sort(key=lambda x: (-x["score"], x["rtt"]))
 
     print(f"\n{CYAN}{BOLD}================================================================={RESET}")
-    print(f"{CYAN}{BOLD}           🏆 REALITY 最佳目标综合排行榜 (推荐度降序)            {RESET}")
+    print(f"{CYAN}{BOLD}          🏆 REALITY 真实原生最佳目标排行 (剔除一切套娃)         {RESET}")
     print(f"{CYAN}{BOLD}================================================================={RESET}\n")
 
     for idx, item in enumerate(found_targets, 1):
-        hot_flag = f"{RED}[⚠️ 大热域名]{RESET}" if item["is_hot"] else f"{GREEN}[小众推荐]{RESET}"
-        redir_flag = f"{YELLOW}(由 {item['raw_sni']} 重定向校准){RESET}" if item["is_redirected"] else ""
+        hot_flag = f"{RED}[⚠️ 热门域名]{RESET}" if item["is_hot"] else f"{GREEN}[原生推荐]{RESET}"
+        redir_flag = f"{YELLOW}(重定向校准自 {item['raw_sni']}){RESET}" if item["is_redirected"] else ""
         print(f"{BOLD}[{idx}] {item['stars']} IP: {item['ip']}:443  (物理延迟: {item['rtt']} ms) {hot_flag}{RESET}")
         print(f"    - 推荐 SNI: {BOLD}{CYAN}{item['sni']}{RESET} {redir_flag}")
         print(f"    - 协议/ALPN: {GREEN}{item['tls_version']}{RESET} | {item['alpn']} | 抗量子: {MAGENTA}{item['pqc']}{RESET}")
-        print(f"    - 证书签发: {item['issuer']} (到期: {item['expire_date']}, 剩余 {item['remaining_days']} 天)")
+        print(f"    - 证书主体: {item['issuer']} (有效期至: {item['expire_date']}, 剩余 {item['remaining_days']} 天)")
         print(f"    {YELLOW}------------------------------------------------------------{RESET}")
-        print(f"    {BOLD}Sing-box 配置参考:{RESET}")
+        print(f"    {BOLD}Sing-box 推荐配置:{RESET}")
         print(f'      "server_name": "{item["sni"]}",')
         print(f'      "reality": {{ "handshake": {{ "server": "{item["ip"]}", "server_port": 443 }} }}')
         print(f"    {YELLOW}------------------------------------------------------------{RESET}\n")
 
-    # 导出 CSV
     if export_csv(found_targets, CSV_OUTPUT):
-        print(f"{GREEN}[✓] 结果已成功导出至: {BOLD}{CSV_OUTPUT}{RESET}")
-        print(f"[*] 提示：该文件可直接导入 RealityChecker-PLUS 进行批量测试：")
+        print(f"{GREEN}[✓] 真实候选目标已成功导出至: {BOLD}{CSV_OUTPUT}{RESET}")
+        print(f"[*] 提示：可配合 RealityChecker-PLUS 进行批量二次压测：")
         print(f"    {CYAN}./reality-checker csv {CSV_OUTPUT}{RESET}\n")
 
 if __name__ == "__main__":
