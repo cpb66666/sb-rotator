@@ -2,11 +2,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-REALITY 同网段 TLS 1.3 精准嗅探器 V8.1 (Zero-False-Positive 零误杀版)
-特点：
-1. 彻底清除导致 100% 误杀独立站点的伪造盲探逻辑
-2. 采用【DNS 权威直指认证】：只要官方 A 记录认领当前 IP，100% 确认是合法宿主，直接放行
-3. 精准拦截偷苹果、微软等不在解析列表中的邻居套娃
+REALITY 同网段 TLS 1.3 嗅探器 V8.2 (Real-Webpage Verified 网页验真版)
+核心升级：
+1. 彻底剔除【只有代理协议、没有实际网页】的纯翻墙小鸡
+2. 模拟真实 Chrome 发送 HTTP GET 探测，核验 HTML 标签与网页实际内容
+3. 权威 DNS 直指归属认证（灭杀大厂套娃）
 4. 交互式深挖，已扫 IP 绝不重复
 """
 
@@ -133,20 +133,71 @@ def probe_ip(ip_str):
         return None
 
 def is_genuine_host(ip, domain):
-    """权威 DNS 归属校验（零误杀）"""
+    """权威 DNS 直指认证"""
     try:
         _, _, official_ips = socket.gethostbyname_ex(domain)
         if ip in official_ips:
-            return True, "官方 DNS 记录直指本 IP (真实宿主)"
+            return True, "官方 DNS 直指本 IP"
         
         target_obj = ipaddress.IPv4Address(ip)
         for oip in official_ips:
             if target_obj in ipaddress.IPv4Network(f"{oip}/24", strict=False):
-                return True, "属于官方服务器同机房集群"
+                return True, "属于同网段企业集群"
                 
         return False, f"官方真实 IP 为 {official_ips[:2]}，当前探测 IP 不在列表中 (套娃机)"
     except Exception as e:
         return False, f"DNS 查询失败: {e}"
+
+def has_real_website(ip, domain):
+    """【核心升级】真实网页存活性核验：模拟 Chrome 访问，排除纯代理空壳"""
+    try:
+        conn = socket.create_connection((ip, 443), timeout=SOCKET_TIMEOUT)
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        s = ctx.wrap_socket(conn, server_hostname=domain)
+
+        req = (
+            f"GET / HTTP/1.1\r\n"
+            f"Host: {domain}\r\n"
+            f"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0\r\n"
+            f"Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n"
+            f"Connection: close\r\n\r\n"
+        )
+        s.sendall(req.encode())
+        
+        raw_resp = b""
+        while True:
+            chunk = s.recv(2048)
+            if not chunk:
+                break
+            raw_resp += chunk
+            if len(raw_resp) > 8192:
+                break
+        s.close()
+
+        if not raw_resp:
+            return False, "连接直接断开/未返回任何 HTTP 内容 (纯代理节点)"
+
+        resp_text = raw_resp.decode('utf-8', errors='ignore').lower()
+
+        status_match = re.search(r'http/\d\.\d\s+(\d+)', resp_text)
+        if not status_match:
+            return False, "返回非 HTTP 响应 (疑似代理流量)"
+
+        status_code = int(status_match.group(1))
+
+        # 301/302 重定向放行
+        if status_code in (301, 302, 307, 308):
+            return True, f"合法重定向站点 ({status_code})"
+
+        # 必须包含 HTML 页面结构或具备充足的网页正文
+        if "<html" in resp_text or "<!doctype" in resp_text or "<head" in resp_text or len(raw_resp) > 150:
+            return True, f"真实网页内容存在 (状态: {status_code}, 正文: {len(raw_resp)}B)"
+
+        return False, f"无实际 Web 页面内容 (状态: {status_code}, 长度仅 {len(raw_resp)}B)"
+    except Exception as e:
+        return False, f"Web 请求异常: {e}"
 
 def verify_target(probe_res):
     ip = probe_res["ip"]
@@ -157,12 +208,19 @@ def verify_target(probe_res):
     ctx.verify_mode = ssl.CERT_REQUIRED
 
     for sni in candidates:
-        # 【零误杀真伪鉴别】：核验当前 IP 是否真被该域名解析所认领
+        # 1. 认证真实宿主（灭杀套娃）
         is_real, auth_msg = is_genuine_host(ip, sni)
         if not is_real:
             print(f"  {RED}[✖ 拦截套娃] IP: {ip:<15} 宣称是 {sni}，但 {auth_msg}！{RESET}")
             continue
 
+        # 2. 【核心升级】：核验浏览器实际打开是否有真实网页（灭杀纯代理空壳）
+        is_web, web_msg = has_real_website(ip, sni)
+        if not is_web:
+            print(f"  {YELLOW}[✖ 拦截空壳] IP: {ip:<15} 域名: {sni} -> {web_msg}！{RESET}")
+            continue
+
+        # 3. 标准 TLS 握手及证书有效性检验
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(SOCKET_TIMEOUT)
         try:
@@ -192,7 +250,8 @@ def verify_target(probe_res):
                 "alpn": alpn,
                 "issuer": issuer_org,
                 "expire_date": expire_date.strftime('%Y-%m-%d'),
-                "remaining_days": remaining_days
+                "remaining_days": remaining_days,
+                "web_info": web_msg
             }
         except Exception:
             try:
@@ -212,6 +271,7 @@ def generate_subnets(base_ip):
 def print_result(idx, item):
     print(f"{BOLD}[{idx}] IP: {item['ip']}:443  (握手延迟: {item['rtt']} ms){RESET}")
     print(f"    - 推荐 SNI: {BOLD}{CYAN}{item['sni']}{RESET}")
+    print(f"    - 网页验证: {GREEN}{item['web_info']}{RESET}")
     print(f"    - 协议/ALPN: {GREEN}TLSv1.3{RESET} | {item['alpn']}")
     print(f"    - 证书签发: {item['issuer']} (剩余: {item['remaining_days']} 天, 到期: {item['expire_date']})")
     print(f"    {YELLOW}------------------------------------------------------------{RESET}")
@@ -222,7 +282,7 @@ def print_result(idx, item):
 
 def main():
     print(f"{CYAN}{BOLD}================================================================={RESET}")
-    print(f"{CYAN}{BOLD}      REALITY TLS 1.3 嗅探器 V8.1 (Zero-False-Positive 零误杀版) {RESET}")
+    print(f"{CYAN}{BOLD}      REALITY TLS 1.3 嗅探器 V8.2 (Real-Webpage Verified 版)     {RESET}")
     print(f"{CYAN}{BOLD}================================================================={RESET}")
 
     my_ip = get_public_ip()
@@ -260,7 +320,7 @@ def main():
                     sys.stdout.write(f"\r  -> 进度: {count}/{len(fresh_ips)} (开放主机: {len(stage1_results)})")
                     sys.stdout.flush()
 
-        print(f"\n[*] 正在执行【DNS 权威直指认证】核验...")
+        print(f"\n[*] 正在执行【DNS 归属鉴别】与【真实网页存活性核验】...")
         for probe_res in stage1_results:
             target = verify_target(probe_res)
             if target:
@@ -270,7 +330,7 @@ def main():
 
             if len(current_batch) >= BATCH_SIZE:
                 print(f"\n{CYAN}{BOLD}================================================================={RESET}")
-                print(f"{CYAN}{BOLD}             🎉 成功捕获到 {len(current_batch)} 个真实可用目标                   {RESET}")
+                print(f"{CYAN}{BOLD}          🎉 成功捕获到 {len(current_batch)} 个【真有网页】的可用目标            {RESET}")
                 print(f"{CYAN}{BOLD}================================================================={RESET}\n")
 
                 current_batch.sort(key=lambda x: x["rtt"])
