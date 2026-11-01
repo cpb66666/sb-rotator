@@ -7,17 +7,18 @@
 #   2. 绝对不影响国内客户端连入本机 (Inbound 完全放行，支持中国 IP 连入代理与 SSH)
 #   3. 开机自启动热恢复规则 (systemd service)
 #   4. 每日定时从境外源自动拉取最新中国 IPv4 / IPv6 地址段并热重载 (systemd timer)
-#   5. 提供便捷 CLI 工具: geo-block status / test / update / whitelist / uninstall
+#   5. 交互式操作菜单 (安装/卸载/状态检查/IP测试/白名单管理)
 # ==============================================================================
 
 set -euo pipefail
 
-# 终端色彩
+# 终端色彩定义
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
+BOLD='\033[1m'
 NC='\033[0m' # No Color
 
 # 关键目录与文件配置
@@ -53,7 +54,7 @@ log_title() {
     echo -e "${CYAN}================================================================${NC}\n"
 }
 
-# 1. 检查 root 权限
+# 1. 权限检查
 check_root() {
     if [[ $EUID -ne 0 ]]; then
         log_error "本脚本需要 root 权限，请使用 'sudo bash $0' 运行。"
@@ -61,10 +62,27 @@ check_root() {
     fi
 }
 
-# 2. 检查并安装依赖
+# 2. 检查安装与运行状态辅助函数
+is_installed() {
+    if [[ -f "${CORE_SCRIPT}" && -f "${SYSTEMD_RESTORE_SERVICE}" ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+is_running() {
+    if command -v nft >/dev/null 2>&1 && nft list table inet geo_block >/dev/null 2>&1; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# 3. 安装依赖包
 install_dependencies() {
     log_info "正在检查并安装必要系统依赖 (nftables, curl, systemd, gawk)..."
-    
+
     if command -v apt-get >/dev/null 2>&1; then
         export DEBIAN_FRONTEND=noninteractive
         apt-get update -qq || true
@@ -100,7 +118,6 @@ install_dependencies() {
         fi
     fi
 
-    # 启用内核 nftables 服务（如果存在）
     if systemctl is-enabled nftables >/dev/null 2>&1; then
         log_info "系统原生 nftables 服务已激活。"
     else
@@ -109,13 +126,12 @@ install_dependencies() {
     log_info "依赖组件检测与安装完成。"
 }
 
-# 3. 创建配置与工作目录
+# 4. 创建配置与工作目录
 setup_directories() {
     log_info "初始化配置目录: ${INSTALL_DIR}"
     mkdir -p "${INSTALL_DIR}"
     chmod 750 "${INSTALL_DIR}"
 
-    # 初始化配置环境变量（全部采用境外镜像源，避免节点阻断自身拉取）
     cat << 'EOF' > "${CONFIG_FILE}"
 # /etc/geo-block/config.env
 # 境外代理节点专用配置：阻断出站中国目标 IP
@@ -149,7 +165,7 @@ EOF
     touch "${WHITELIST_IPV6_FILE}"
     chmod 640 "${WHITELIST_IPV4_FILE}" "${WHITELIST_IPV6_FILE}"
 
-    # 检查并自动放行 /etc/resolv.conf 中的 DNS 服务器，防止因为使用了国内 DNS 导致域名解析全部瘫痪
+    # 自动探测并将 /etc/resolv.conf 中的 DNS 写入白名单，防止国内 DNS 导致解析中断
     if [[ -f /etc/resolv.conf ]]; then
         local dns_ips
         dns_ips=$(grep -E '^[[:space:]]*nameserver' /etc/resolv.conf | awk '{print $2}' || true)
@@ -169,7 +185,7 @@ EOF
     fi
 }
 
-# 4. 生成核心控制脚本 (/usr/local/bin/geo-block-update.sh)
+# 5. 生成核心控制脚本 (/usr/local/bin/geo-block-update.sh)
 create_core_script() {
     log_info "生成核心控制脚本: ${CORE_SCRIPT}"
 
@@ -206,12 +222,12 @@ NC='\033[0m'
 
 # 初始化基础表结构 (table inet geo_block)
 init_base_table() {
-    # 策略重点说明:
-    # 1. 绝不创建或过滤 input 链: 允许所有国内外 IP 正常连接本机 (SSH、代理监听端口完全不受限)
-    # 2. output 链: 限制本机发出的流量
-    #    - ct state established,related: 关键！允许发回给国内客户端的响应数据包不受阻碍
-    #    - ip daddr @china_ipv4: 阻止本机主动向中国 IP 建立新连接
-    # 3. forward 链: 限制路由/转发的流量 (针对 TUN、WireGuard、透明代理转发)
+    # 策略架构:
+    # 1. 绝不创建 input 过滤链: 保证国内客户端连接代理端口及 SSH 畅通无阻
+    # 2. output 链:
+    #    - ct state established,related: 放行发回给客户端的回程数据包
+    #    - ip daddr @china_ipv4: 阻止本机主动连接中国境内目标
+    # 3. forward 链: 阻止经本机转发往中国目标的流量 (针对 TUN/WireGuard 等模式)
     cat << 'NFT_BASE' | nft -f -
 table inet geo_block {
     set whitelist_ipv4 {
@@ -240,15 +256,14 @@ table inet geo_block {
         # 1. 放行本地回环接口流量
         oif "lo" accept
 
-        # 2. 核心状态放行: 允许已建立和关联连接的回程数据包！
-        # 这确保了国内客户端主动连入代理/SSH时，服务器发回给客户端的数据包能够畅通返回！
+        # 2. 状态放行: 允许已建立和关联连接的回程数据包 (关键！保证国内客户端连接不断流)
         ct state established,related accept
 
         # 3. 放行用户自定义目标白名单
         ip daddr @whitelist_ipv4 accept
         ip6 daddr @whitelist_ipv6 accept
 
-        # 4. 阻断本机主动发往中国大陆 IP 的流量 (新连接)
+        # 4. 阻断本机主动发往中国大陆 IP 的新连接
         ip daddr @china_ipv4 counter reject
         ip6 daddr @china_ipv6 counter reject
     }
@@ -256,14 +271,11 @@ table inet geo_block {
     chain forward {
         type filter hook forward priority filter; policy accept;
 
-        # 转发流量状态放行
         ct state established,related accept
 
-        # 转发目标白名单放行
         ip daddr @whitelist_ipv4 accept
         ip6 daddr @whitelist_ipv6 accept
 
-        # 阻断经由本机转发往中国大陆 IP 的流量 (TUN/VPN 等)
         ip daddr @china_ipv4 counter reject
         ip6 daddr @china_ipv6 counter reject
     }
@@ -271,7 +283,6 @@ table inet geo_block {
 NFT_BASE
 }
 
-# 格式化 IP 列表为 nftables 元素语法
 format_nft_elements() {
     local file="$1"
     if [[ ! -s "$file" ]]; then
@@ -288,7 +299,6 @@ format_nft_elements() {
     }' "$file"
 }
 
-# 刷新白名单 Set
 apply_whitelist() {
     local tmp_nft
     tmp_nft=$(mktemp)
@@ -322,7 +332,6 @@ apply_whitelist() {
     rm -f "$tmp_nft"
 }
 
-# 从境外源拉取中国 IP 列表
 download_ip_list() {
     local ip_version="$1"
     local output_file="$2"
@@ -367,7 +376,6 @@ download_ip_list() {
     fi
 }
 
-# 原子批量加载缓存的 IP 列表到 nftables
 apply_cached_rules() {
     init_base_table
     apply_whitelist
@@ -391,7 +399,6 @@ apply_cached_rules() {
         fi
     } > "$tmp_batch"
 
-    # 单事务原子更新
     nft -f "$tmp_batch"
     rm -f "$tmp_batch"
 
@@ -403,7 +410,7 @@ apply_cached_rules() {
 }
 
 action_update() {
-    echo -e "${CYAN}>>> 开始从境外源拉取最新中国 IP 列表...${NC}"
+    echo -e "${CYAN}>>> 开始从境外镜像源拉取最新中国 IP 列表...${NC}"
     local err=0
 
     download_ip_list "4" "${IPV4_CACHE_FILE}.new" "${MIN_IPV4_LINES}" "${IPV4_URLS[@]}" || err=$((err + 1))
@@ -444,17 +451,17 @@ action_stop() {
 action_status() {
     echo -e "${CYAN}================== nftables 代理节点出站阻断状态 ==================${NC}"
     if ! nft list table inet geo_block >/dev/null 2>&1; then
-        echo -e "状态: ${RED}未运行 (table inet geo_block 不存在)${NC}"
+        echo -e "运行状态: ${RED}未生效 (table inet geo_block 规则表不存在)${NC}"
         return 0
     fi
 
-    echo -e "状态: ${GREEN}运行中 (本机/转发对外访问中国 IP 已阻断，入站连接完全不受限)${NC}\n"
+    echo -e "运行状态: ${GREEN}运行中 (已成功阻断本机/转发访问中国 IP)${NC}\n"
 
-    echo -e "${CYAN}[阻断统计计数 (Reject/Drop Counters)]${NC}"
-    echo "--- Output 链 (本机发起的出站访问):"
-    nft list chain inet geo_block output 2>/dev/null | grep -E "reject|drop|counter" || echo "无计数"
+    echo -e "${CYAN}[拦截统计计数 (Reject/Drop Counters)]${NC}"
+    echo "--- Output 链 (本机主动发起的出站访问):"
+    nft list chain inet geo_block output 2>/dev/null | grep -E "reject|drop|counter" || echo "  无匹配计数"
     echo "--- Forward 链 (路由/转发的流量):"
-    nft list chain inet geo_block forward 2>/dev/null | grep -E "reject|drop|counter" || echo "无计数"
+    nft list chain inet geo_block forward 2>/dev/null | grep -E "reject|drop|counter" || echo "  无匹配计数"
 
     echo -e "\n${CYAN}[Set 规则库规模]${NC}"
     local v4_lines=0 v6_lines=0 wl4_lines=0 wl6_lines=0
@@ -477,7 +484,7 @@ action_status() {
         echo "IPv6 白名单:"
         sed 's/^/  * /' "${WHITELIST_IPV6_FILE}"
     fi
-    if [[ $wl4_lines -eq 0 && $wl6_lines -eq 0 ]]; then
+    if [[ $wl4_lines -eq 0 && $wl4_lines -eq 0 ]]; then
         echo "  (暂无手动添加的白名单 IP)"
     fi
 
@@ -486,14 +493,14 @@ action_status() {
     echo -e "${CYAN}===================================================================${NC}"
 }
 
-# 诊断测试 IP 是否会被拦截
 action_test() {
     local target_ip="${1:-}"
     if [[ -z "$target_ip" ]]; then
-        echo "用法: geo-block test <目标IP>"
-        echo "示例: geo-block test 223.5.5.5 (测试国内 IP 是否被阻断)"
-        echo "      geo-block test 8.8.8.8   (测试国外 IP 是否正常放行)"
-        return 1
+        read -r -p "请输入要测试的目标 IP 地址: " target_ip
+        if [[ -z "$target_ip" ]]; then
+            echo "输入为空，取消测试。"
+            return 1
+        fi
     fi
 
     echo -e "${CYAN}>>> 正在测试目标 IP: ${target_ip}${NC}"
@@ -512,14 +519,36 @@ action_test() {
     fi
 }
 
-# 白名单管理
 action_whitelist() {
     local op="${1:-}"
     local ip="${2:-}"
 
-    if [[ -z "$op" || -z "$ip" ]]; then
-        echo "用法: geo-block whitelist add <IP> 或 geo-block whitelist del <IP>"
-        return 1
+    if [[ -z "$op" ]]; then
+        echo "请选择白名单操作:"
+        echo "  1) 添加白名单 IP"
+        echo "  2) 删除白名单 IP"
+        echo "  3) 查看当前白名单"
+        read -r -p "请输入选项 [1-3]: " wl_choice
+        case "$wl_choice" in
+            1) op="add" ;;
+            2) op="del" ;;
+            3)
+                echo -e "\n${CYAN}当前 IPv4 白名单:${NC}"
+                cat "${WHITELIST_IPV4_FILE}" 2>/dev/null || echo "无"
+                echo -e "\n${CYAN}当前 IPv6 白名单:${NC}"
+                cat "${WHITELIST_IPV6_FILE}" 2>/dev/null || echo "无"
+                return 0
+                ;;
+            *) echo "无效选项"; return 1 ;;
+        esac
+    fi
+
+    if [[ -z "$ip" ]]; then
+        read -r -p "请输入目标 IP 地址: " ip
+        if [[ -z "$ip" ]]; then
+            echo "IP 不能为空。"
+            return 1
+        fi
     fi
 
     local target_file="${WHITELIST_IPV4_FILE}"
@@ -568,14 +597,14 @@ case "${1:-status}" in
         ;;
     test)
         shift
-        action_test "$@"
+        action_test "${1:-}"
         ;;
     whitelist)
         shift
-        action_whitelist "$@"
+        action_whitelist "${1:-}" "${2:-}"
         ;;
     *)
-        echo "用法: $0 {status|test <IP>|update|restore|stop|whitelist add <IP>|whitelist del <IP>}"
+        echo "用法: $0 {status|test <IP>|update|restore|stop|whitelist}"
         exit 1
         ;;
 esac
@@ -586,7 +615,7 @@ EOF
     log_info "核心脚本配置完成，已创建软链接: ${CLI_LINK}"
 }
 
-# 5. 配置 systemd 开机自启服务与每日定时器
+# 6. 配置 systemd 服务与定时器
 setup_systemd() {
     log_info "配置开机自启系统服务与定时更新任务..."
 
@@ -638,39 +667,9 @@ EOF
     log_info "开机自启服务 (geo-block.service) 与定时器 (geo-block-update.timer) 配置成功并已启用！"
 }
 
-# 6. 一键卸载
-uninstall() {
-    log_title "正在卸载 nftables 代理节点出站阻断系统..."
-
-    systemctl stop geo-block-update.timer 2>/dev/null || true
-    systemctl disable geo-block-update.timer 2>/dev/null || true
-    systemctl stop geo-block.service 2>/dev/null || true
-    systemctl disable geo-block.service 2>/dev/null || true
-
-    rm -f "${SYSTEMD_RESTORE_SERVICE}" "${SYSTEMD_UPDATE_SERVICE}" "${SYSTEMD_UPDATE_TIMER}"
-    systemctl daemon-reload 2>/dev/null || true
-
-    if [[ -x "${CORE_SCRIPT}" ]]; then
-        "${CORE_SCRIPT}" stop 2>/dev/null || true
-    else
-        nft delete table inet geo_block 2>/dev/null || true
-    fi
-
-    rm -f "${CLI_LINK}" "${CORE_SCRIPT}"
-    rm -rf "${INSTALL_DIR}"
-
-    log_info "卸载已完成！所有 nftables 规则、定时器、系统服务及配置文件已彻底清除。"
-    exit 0
-}
-
-# 主程序入口
-main() {
-    if [[ "${1:-}" == "--uninstall" || "${1:-}" == "uninstall" ]]; then
-        check_root
-        uninstall
-    fi
-
-    log_title "开始部署 nftables 代理节点专用阻断方案 (阻止访问中国)"
+# 7. 安装流程主函数
+do_install() {
+    log_title "开始自动化部署 nftables 代理节点出站阻断系统"
 
     check_root
     install_dependencies
@@ -695,16 +694,224 @@ main() {
     echo -e "  * ${YELLOW}阻断出站中国目标${NC}: 代理节点无法访问中国境内的 Web/API/服务器 (返回 Reject)。"
     echo -e "  * ${CYAN}开机自启动生效${NC}: 系统重启后秒级恢复规则，无需手动干预。"
     echo -e "  * ${CYAN}每日境外源自动更新${NC}: 每天凌晨通过境外源同步最新 CIDR 网段。"
-    echo -e "\n常用管理命令 (直接在终端运行):"
-    echo -e "  * 查看状态与拦截计数:  ${CYAN}geo-block status${NC}"
-    echo -e "  * 测试目标 IP 是否阻断: ${CYAN}geo-block test 223.5.5.5${NC}"
-    echo -e "  * 手动立即更新 IP 库:  ${CYAN}geo-block update${NC}"
-    echo -e "  * 添加允许的目标 IP:   ${CYAN}geo-block whitelist add <IP/网段>${NC}"
-    echo -e "  * 移除允许的目标 IP:   ${CYAN}geo-block whitelist del <IP/网段>${NC}"
-    echo -e "  * 暂停拦截规则:        ${CYAN}geo-block stop${NC}"
-    echo -e "  * 恢复拦截规则:        ${CYAN}geo-block restore${NC}"
-    echo -e "  * 完整一键卸载:        ${CYAN}sudo bash $0 --uninstall${NC}"
     echo -e "================================================================\n"
+}
+
+# 8. 卸载流程函数
+do_uninstall() {
+    log_title "正在卸载 nftables 代理节点出站阻断系统..."
+    check_root
+
+    systemctl stop geo-block-update.timer 2>/dev/null || true
+    systemctl disable geo-block-update.timer 2>/dev/null || true
+    systemctl stop geo-block.service 2>/dev/null || true
+    systemctl disable geo-block.service 2>/dev/null || true
+
+    rm -f "${SYSTEMD_RESTORE_SERVICE}" "${SYSTEMD_UPDATE_SERVICE}" "${SYSTEMD_UPDATE_TIMER}"
+    systemctl daemon-reload 2>/dev/null || true
+
+    if [[ -x "${CORE_SCRIPT}" ]]; then
+        "${CORE_SCRIPT}" stop 2>/dev/null || true
+    else
+        nft delete table inet geo_block 2>/dev/null || true
+    fi
+
+    rm -f "${CLI_LINK}" "${CORE_SCRIPT}"
+    rm -rf "${INSTALL_DIR}"
+
+    log_info "卸载已完成！所有 nftables 规则、定时器、系统服务及配置文件已彻底清除。"
+}
+
+# 9. 查看状态流程函数
+do_status() {
+    log_title "nftables Geo-Block 服务状态检测"
+
+    echo -e "${BOLD}1. 安装状态检测:${NC}"
+    if is_installed; then
+        echo -e "   安装状态: ${GREEN}已安装${NC} (主控脚本与 Systemd 单元就绪)"
+    else
+        echo -e "   安装状态: ${RED}未安装${NC} (尚未部署此服务)"
+    fi
+
+    echo -e "\n${BOLD}2. 规则运行状态检测:${NC}"
+    if is_running; then
+        echo -e "   运行状态: ${GREEN}运行中 (Active)${NC} (nftables geo_block 表已加载生效)"
+    else
+        echo -e "   运行状态: ${RED}未运行 (Inactive)${NC} (未检测到 geo_block 规则表)"
+    fi
+
+    echo -e "\n${BOLD}3. 开机自启服务状态:${NC}"
+    if systemctl is-enabled geo-block.service >/dev/null 2>&1; then
+        echo -e "   开机自启: ${GREEN}已启用 (Enabled)${NC}"
+    else
+        echo -e "   开机自启: ${YELLOW}未启用或服务不存在${NC}"
+    fi
+
+    echo -e "\n${BOLD}4. 每日定时器状态:${NC}"
+    if systemctl is-active geo-block-update.timer >/dev/null 2>&1; then
+        echo -e "   每日更新定时器: ${GREEN}运行中 (Active)${NC}"
+        local next_run
+        next_run=$(systemctl list-timers geo-block-update.timer --no-legend 2>/dev/null | awk '{print $1, $2, $3}' || true)
+        [[ -n "$next_run" ]] && echo -e "   下次触发时间:   ${CYAN}${next_run}${NC}"
+    else
+        echo -e "   每日更新定时器: ${YELLOW}未激活${NC}"
+    fi
+
+    if is_installed && is_running; then
+        echo -e "\n${BOLD}5. 规则与拦截详细数据:${NC}"
+        "${CORE_SCRIPT}" status
+    fi
+}
+
+# 10. 交互式菜单展示
+show_menu() {
+    clear 2>/dev/null || true
+    echo -e "${CYAN}================================================================${NC}"
+    echo -e "${CYAN}          nftables 代理节点出站中国 IP 拦截自动化系统           ${NC}"
+    echo -e "${CYAN}================================================================${NC}"
+
+    # 动态显示状态看板
+    local install_status run_status
+    if is_installed; then
+        install_status="${GREEN}已安装${NC}"
+    else
+        install_status="${RED}未安装${NC}"
+    fi
+
+    if is_running; then
+        run_status="${GREEN}运行中${NC}"
+    else
+        run_status="${RED}未运行${NC}"
+    fi
+
+    echo -e "系统状态: 安装状态: [${install_status}] | 拦截状态: [${run_status}]"
+    echo -e "节点定位: 境外代理节点 (国内客户端正常连入，仅禁止服务器访问中国目标)"
+    echo -e "${CYAN}----------------------------------------------------------------${NC}"
+    echo -e "  ${BOLD}1.${NC} 安装 / 重新安装拦截服务"
+    echo -e "  ${BOLD}2.${NC} 卸载拦截服务"
+    echo -e "  ${BOLD}3.${NC} 查看状态 (检查是否安装、是否运行及拦截统计)"
+    echo -e "  ${BOLD}4.${NC} 手动立即拉取更新中国 IP 列表"
+    echo -e "  ${BOLD}5.${NC} 测试目标 IP 是否会被节点阻断 (诊断工具)"
+    echo -e "  ${BOLD}6.${NC} 目标 IP 白名单管理 (添加 / 删除 / 查看)"
+    echo -e "  ${BOLD}7.${NC} 暂停 / 恢复拦截规则"
+    echo -e "  ${BOLD}0.${NC} 退出菜单"
+    echo -e "${CYAN}================================================================${NC}"
+
+    read -r -p "请输入选项数字 [0-7]: " menu_choice
+    echo ""
+
+    case "$menu_choice" in
+        1)
+            do_install
+            ;;
+        2)
+            read -r -p "确定要彻底卸载拦截服务吗？[y/N]: " confirm_un
+            if [[ "$confirm_un" =~ ^[yY]$ ]]; then
+                do_uninstall
+            else
+                echo "已取消卸载。"
+            fi
+            ;;
+        3)
+            do_status
+            ;;
+        4)
+            if is_installed; then
+                "${CORE_SCRIPT}" update
+            else
+                log_error "服务尚未安装，请先选择 1 进行安装。"
+            fi
+            ;;
+        5)
+            if is_installed && is_running; then
+                "${CORE_SCRIPT}" test
+            else
+                log_error "服务尚未运行，请先安装或启动服务。"
+            fi
+            ;;
+        6)
+            if is_installed; then
+                "${CORE_SCRIPT}" whitelist
+            else
+                log_error "服务尚未安装，请先选择 1 进行安装。"
+            fi
+            ;;
+        7)
+            if ! is_installed; then
+                log_error "服务尚未安装，请先选择 1 进行安装。"
+            elif is_running; then
+                read -r -p "当前正在运行拦截，是否暂停拦截？[y/N]: " confirm_pause
+                if [[ "$confirm_pause" =~ ^[yY]$ ]]; then
+                    "${CORE_SCRIPT}" stop
+                fi
+            else
+                read -r -p "当前拦截未运行，是否恢复拦截？[y/N]: " confirm_resume
+                if [[ "$confirm_resume" =~ ^[yY]$ ]]; then
+                    "${CORE_SCRIPT}" restore
+                fi
+            fi
+            ;;
+        0)
+            echo "感谢使用，再见！"
+            exit 0
+            ;;
+        *)
+            echo -e "${RED}输入无效，请输入数字 0 到 7。${NC}"
+            ;;
+    esac
+}
+
+# 主程序入口：支持直接带参数运行，无参数时启动交互式菜单
+main() {
+    check_root
+
+    local action="${1:-menu}"
+    case "$action" in
+        1|install|--install)
+            do_install
+            ;;
+        2|uninstall|--uninstall)
+            do_uninstall
+            ;;
+        3|status|--status)
+            do_status
+            ;;
+        4|update|--update)
+            if is_installed; then
+                "${CORE_SCRIPT}" update
+            else
+                log_error "服务尚未安装，请先运行 '$0 1' 进行安装。"
+            fi
+            ;;
+        5|test)
+            shift
+            if is_installed && is_running; then
+                "${CORE_SCRIPT}" test "${1:-}"
+            else
+                log_error "服务未运行。"
+            fi
+            ;;
+        6|whitelist)
+            shift
+            if is_installed; then
+                "${CORE_SCRIPT}" whitelist "$@"
+            else
+                log_error "服务尚未安装。"
+            fi
+            ;;
+        menu|--menu|"")
+            while true; do
+                show_menu
+                echo ""
+                read -r -p "按回车键返回主菜单，或按 Ctrl+C 退出..." _
+            done
+            ;;
+        *)
+            echo "用法: $0 [1|install | 2|uninstall | 3|status | 4|update | 5|test <IP> | 6|whitelist]"
+            echo "直接运行 '$0' 可进入全功能交互式菜单。"
+            exit 1
+            ;;
+    esac
 }
 
 main "$@"
