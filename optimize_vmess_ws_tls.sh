@@ -7,6 +7,8 @@
 #   [3] 一键修改 VLESS-REALITY (偷相邻/指定外部域名：无需本机建站，直接修改 SNI 与握手目标)
 #   [4] 一键独立部署 Caddy + 静态伪装网站 (输入域名自动建站，可供本机或相邻机器 REALITY 借用)
 #   [5] 仅更换 /var/www/html 静态伪装网站模板 (内置 5 套跨行业响应式站点，支持随机或指定)
+#   [6] 一键重启 Sing-box 与 Caddy 服务
+#   [7] 一键完全卸载 Caddy 与伪装网站配置
 # ==============================================================================
 
 set -uo pipefail
@@ -94,7 +96,6 @@ install_caddy_binary_fallback() {
     local tmp_dir
     tmp_dir=$(mktemp -d)
     local dl_url="https://github.com/caddyserver/caddy/releases/latest/download/caddy_2.8.4_linux_${caddy_arch}.tar.gz"
-    # 动态获取最新版本号（若获取失败则回退到稳定版 2.8.4）
     local latest_tag=""
     latest_tag=$(curl -fsSL https://api.github.com/repos/caddyserver/caddy/releases/latest 2>/dev/null | grep -oP '"tag_name":\s*"v\K[^"]+' || true)
     if [[ -n "$latest_tag" ]]; then
@@ -110,7 +111,6 @@ install_caddy_binary_fallback() {
         return 1
     fi
 
-    # 创建 caddy 用户组与 systemd unit
     groupadd --system caddy 2>/dev/null || true
     useradd --system \
         --gid caddy \
@@ -146,15 +146,14 @@ EOF
 }
 
 ensure_caddy() {
-    local mode="${1:-vmess}"       # vmess / standalone 或 reality
-    local https_port="${2:-8443}"  # 当 mode=reality 时使用的 https_port
+    local mode="${1:-vmess}"
+    local https_port="${2:-8443}"
 
     mkdir -p "$BACKUP_DIR/caddy" "$CADDY_CONF_DIR" "$WEB_ROOT"
 
     if ! command -v caddy >/dev/null 2>&1; then
         log_warn "未检测到 Caddy，正在为您自动安装 Caddy (显示安装进度)..."
         if command -v apt-get >/dev/null 2>&1; then
-            # 清理可能残留的损坏源，防止 apt-get update 返回非 0 退出码
             rm -f /etc/apt/sources.list.d/caddy-stable.list
             DEBIAN_FRONTEND=noninteractive apt-get update -y || true
             DEBIAN_FRONTEND=noninteractive apt-get install -y caddy curl ca-certificates || true
@@ -166,7 +165,6 @@ ensure_caddy() {
             apk add --no-cache caddy curl ca-certificates || true
         fi
 
-        # 若系统默认软件源未包含 caddy，则使用官方二进制回退方案安装
         if ! command -v caddy >/dev/null 2>&1; then
             install_caddy_binary_fallback || true
         fi
@@ -179,7 +177,6 @@ ensure_caddy() {
         log_ok "Caddy 安装完成: $(caddy version 2>/dev/null || echo 'OK')"
     fi
 
-    # 校验并修正 /etc/caddy/Caddyfile
     if [[ ! -f "$CADDY_MAIN_CONF" ]]; then
         log_info "正在创建主配置文件 $CADDY_MAIN_CONF ..."
         if [[ "$mode" == "reality" ]]; then
@@ -198,7 +195,6 @@ EOF
         log_ok "已初始化 $CADDY_MAIN_CONF"
     else
         cp -a "$CADDY_MAIN_CONF" "$BACKUP_DIR/caddy/Caddyfile.bak"
-        # Debian/Ubuntu apt 安装的默认 Caddyfile 含有 :80 欢迎站点且没有 import /etc/caddy/233boy/*.conf
         if ! grep -q "${CADDY_CONF_DIR}" "$CADDY_MAIN_CONF"; then
             log_info "正在更新 $CADDY_MAIN_CONF 以加载 ${CADDY_CONF_DIR}/*.conf ..."
             if [[ "$mode" == "reality" ]]; then
@@ -216,7 +212,6 @@ EOF
             fi
             log_ok "已配置 $CADDY_MAIN_CONF 加载 ${CADDY_CONF_DIR}/*.conf"
         elif [[ "$mode" == "reality" ]] && ! grep -q "https_port" "$CADDY_MAIN_CONF"; then
-            # 如果已是 233boy 的 Caddyfile 但还没有 https_port，为 reality 本地回源模式写入 https_port
             cat << EOF > "$CADDY_MAIN_CONF"
 {
     http_port 80
@@ -1163,7 +1158,6 @@ deploy_standalone_caddy_site() {
         fi
     done
 
-    # 自动检测 443 端口是否已被 sing-box 占用，给出智能默认建议
     local port443_process=""
     if command -v ss >/dev/null 2>&1; then
         port443_process=$(ss -tulpn 2>/dev/null | grep -E ':443\b' || true)
@@ -1189,7 +1183,6 @@ deploy_standalone_caddy_site() {
         ensure_caddy "standalone"
     fi
 
-    # 选择行业模板
     change_website_menu
 
     local caddy_file="$CADDY_CONF_DIR/${site_domain}.conf"
@@ -1262,6 +1255,87 @@ change_website_menu() {
 }
 
 # ==============================================================================
+# 功能 6：一键重启 Sing-box 与 Caddy 服务交互函数
+# ==============================================================================
+restart_services_interactive() {
+    echo ""
+    log_info "正在重启 Sing-box 与 Caddy 代理与伪装服务..."
+    restart_services
+    echo ""
+    log_ok "所有服务状态已检查并重启完成！"
+}
+
+# ==============================================================================
+# 功能 7：一键完全卸载 Caddy 与伪装配置
+# ==============================================================================
+uninstall_caddy_and_masquerade() {
+    echo ""
+    echo -e "${RED}======================================================================${NC}"
+    echo -e "${RED}             ⚠️  警告：一键卸载 Caddy 及伪装建站组件                   ${NC}"
+    echo -e "${RED}======================================================================${NC}"
+    echo -e "该操作将执行以下流程："
+    echo -e "  1. 停止并禁用 Caddy 服务 (systemctl stop/disable caddy)"
+    echo -e "  2. 卸载 Caddy 软件包及二进制程序 (/usr/bin/caddy 等)"
+    echo -e "  3. 删除 Caddy 配置文件与服务单元 (/etc/caddy, /var/lib/caddy, caddy.service)"
+    echo -e "  4. 自动备份当前配置至: ${YELLOW}${BACKUP_DIR}/pre_uninstall_backup${NC}"
+    echo -e "  5. 可选择是否一并清理伪装网页根目录 (${WEB_ROOT})"
+    echo ""
+    read -r -p "是否确认继续完全卸载？[y/N]: " confirm_uninstall
+    if [[ ! "$confirm_uninstall" =~ ^[yY]$ ]]; then
+        log_info "已取消卸载操作。"
+        return 0
+    fi
+
+    # 卸载前自动备份
+    mkdir -p "$BACKUP_DIR/pre_uninstall_backup"
+    if [[ -d "/etc/caddy" ]]; then
+        cp -a /etc/caddy "$BACKUP_DIR/pre_uninstall_backup/" 2>/dev/null || true
+    fi
+
+    log_info "正在停止并禁用 Caddy 服务..."
+    systemctl stop caddy >/dev/null 2>&1 || true
+    systemctl disable caddy >/dev/null 2>&1 || true
+    caddy stop >/dev/null 2>&1 || true
+
+    log_info "正在通过包管理器卸载 Caddy..."
+    if command -v apt-get >/dev/null 2>&1; then
+        DEBIAN_FRONTEND=noninteractive apt-get purge -y caddy >/dev/null 2>&1 || true
+        rm -f /etc/apt/sources.list.d/caddy-stable.list
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf remove -y caddy >/dev/null 2>&1 || true
+    elif command -v yum >/dev/null 2>&1; then
+        yum remove -y caddy >/dev/null 2>&1 || true
+    elif command -v apk >/dev/null 2>&1; then
+        apk del caddy >/dev/null 2>&1 || true
+    fi
+
+    log_info "正在清理 Caddy 核心文件、服务单元与配置目录..."
+    rm -f /usr/bin/caddy /usr/local/bin/caddy
+    rm -f /etc/systemd/system/caddy.service /lib/systemd/system/caddy.service
+    rm -rf /etc/caddy /var/lib/caddy
+    userdel -r caddy >/dev/null 2>&1 || true
+    groupdel caddy >/dev/null 2>&1 || true
+    systemctl daemon-reload || true
+
+    echo ""
+    read -r -p "是否一并删除静态网站目录 ${WEB_ROOT}？[y/N]: " del_web
+    if [[ "$del_web" =~ ^[yY]$ ]]; then
+        rm -rf "$WEB_ROOT"
+        log_ok "已清除静态伪装站点目录: ${WEB_ROOT}"
+    else
+        log_info "已保留静态网页目录: ${WEB_ROOT}"
+    fi
+
+    echo ""
+    echo -e "${GREEN}======================================================================${NC}"
+    echo -e "${GREEN} 🎉 Caddy 及伪装建站组件已完全卸载并清理干净！${NC}"
+    echo -e "${GREEN}======================================================================${NC}"
+    echo -e "📦 卸载前配置已归档至 : ${YELLOW}${BACKUP_DIR}/pre_uninstall_backup${NC}"
+    echo -e "💡 提示：若此前节点曾通过 Caddy 反代或偷取本地 8443，请记得检查 Sing-box 配置。"
+    echo -e "${GREEN}======================================================================${NC}"
+}
+
+# ==============================================================================
 # 交互式主菜单
 # ==============================================================================
 show_main_menu() {
@@ -1274,9 +1348,11 @@ show_main_menu() {
     echo -e "  [${GREEN}3${NC}] 一键修改 ${CYAN}VLESS-REALITY [偷相邻/外部域名]${NC} (无需本机建站，直接改 SNI 与握手目标)"
     echo -e "  [${GREEN}4${NC}] 一键部署 ${CYAN}Caddy + 静态伪装网站${NC} (输入域名自动开启 HTTPS 站点，供本机或邻机使用)"
     echo -e "  [${GREEN}5${NC}] 仅更换 ${CYAN}/var/www/html${NC} 静态网站 HTML 模板 (内置 5 套行业响应式网站)"
+    echo -e "  [${GREEN}6${NC}] 一键重启 ${CYAN}Sing-box 与 Caddy 服务${NC}"
+    echo -e "  [${GREEN}7${NC}] 一键完全卸载 ${RED}Caddy 与伪装网站配置${NC}"
     echo -e "  [${GREEN}0${NC}] 退出脚本"
     echo -e "${BLUE}================================================================================${NC}"
-    read -r -p "请输入操作序号 [0-5]: " menu_choice
+    read -r -p "请输入操作序号 [0-7]: " menu_choice
 
     case "$menu_choice" in
         1)
@@ -1294,12 +1370,18 @@ show_main_menu() {
         5)
             change_website_menu
             ;;
+        6)
+            restart_services_interactive
+            ;;
+        7)
+            uninstall_caddy_and_masquerade
+            ;;
         0)
             log_info "已退出脚本。"
             exit 0
             ;;
         *)
-            log_err "输入无效，请输入 0-5 之间的数字！"
+            log_err "输入无效，请输入 0-7 之间的数字！"
             exit 1
             ;;
     esac
@@ -1322,6 +1404,12 @@ if [[ $# -gt 0 ]]; then
             ;;
         web|--web)
             change_website_menu
+            ;;
+        restart|--restart)
+            restart_services_interactive
+            ;;
+        uninstall|--uninstall)
+            uninstall_caddy_and_masquerade
             ;;
         *)
             DEFAULT_WS_PATH="$1"
