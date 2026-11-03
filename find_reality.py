@@ -232,8 +232,8 @@ def scan_subnet_ptr_domains(base_ip):
             res_lists = executor.map(query_ptr, sample_ips)
             for r in res_lists:
                 for d in r:
-                    if len(d) > 3 and not re.match(r'^\d+\.\d+\.\d+\.\d+$', d):
-                        found_domains.add(d.lower())
+                   if len(d) > 3 and not re.match(r'^\d+\.\d+\.\d+\.\d+$', d):
+    found_domains.add(d.lower())
     except Exception:
         pass
     return list(found_domains)
