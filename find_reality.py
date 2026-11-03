@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-REALITY 全球中大型正规网站同 ASN 纯净优选工具 V15.0 (1000+ Massive Enterprise)
+REALITY 全球中大型正规网站同 ASN 纯净优选工具 V16.0 (1000+ Massive Enterprise)
 
 核心流程:
 1. 绝对不主动扫 IP (彻底避免抓到其他用户 REALITY 偷跑证书或套娃节点的风险)。
@@ -31,7 +31,7 @@ MAGENTA = "\033[35m"
 BOLD = "\033[1m"
 RESET = "\033[0m"
 
-# ==================== 1000+ 全球中大型正规网站与大厂业务域名库 ====================
+# ==================== 1050+ 全球中大型正规网站与大厂业务域名库 ====================
 DOMAINS_POOL = [
     # ---------- 1. 腾讯与腾讯云全球生态 (AS132203 / AS45090) ----------
     "intl.cloud.tencent.com", "cloud.tencent.com", "tencentcloud.com", "www.tencentcloud.com",
@@ -47,12 +47,14 @@ DOMAINS_POOL = [
     "kms.tencentcloudapi.com", "lighthouse.tencentcloudapi.com", "tat.tencentcloudapi.com",
     "news.qq.com", "map.qq.com", "v.qq.com", "privacy.qq.com", "game.qq.com", "sports.qq.com",
     "mat1.gtimg.com", "in.qq.com", "wj.qq.com", "doc.weixin.qq.com", "pay.weixin.qq.com",
+    "sg.tencentcloud.com", "hk.tencentcloud.com", "jp.tencentcloud.com", "riotgames.com", "epicgames.com",
 
     # ---------- 2. 阿里与阿里云全球生态 (AS45102 / AS37963) ----------
     "www.alibabacloud.com", "account.alibabacloud.com", "www.aliyun.com", "developer.aliyun.com",
     "help.aliyun.com", "cr.console.aliyun.com", "ecs.console.aliyun.com", "dns.console.aliyun.com",
     "www.alibaba.com", "www.aliexpress.com", "www.taobao.com", "www.tmall.com", "www.dingtalk.com",
     "open.dingtalk.com", "www.damo.alibaba.com", "mirrors.aliyun.com", "developer.alibaba.com",
+    "sg.alibabacloud.com", "jp.alibabacloud.com", "us.alibabacloud.com", "eu.alibabacloud.com",
 
     # ---------- 3. 亚马逊 AWS 全球生态 (AS16509 / AS14618) ----------
     "aws.amazon.com", "console.aws.amazon.com", "docs.aws.amazon.com", "amazon.com",
@@ -60,6 +62,7 @@ DOMAINS_POOL = [
     "s3.amazonaws.com", "cloudfront.net", "alexa.amazon.com", "pay.amazon.com",
     "advertising.amazon.com", "sellercentral.amazon.com", "kdp.amazon.com", "www.audible.com",
     "www.goodreads.com", "www.imdb.com", "www.twitch.tv", "www.wholefoodsmarket.com",
+    "www.zappos.com", "www.shopbop.com", "www.woot.com", "www.ring.com", "www.eero.com",
 
     # ---------- 4. 微软 Azure & Microsoft (AS8075 / AS8068) ----------
     "azure.microsoft.com", "portal.azure.com", "learn.microsoft.com", "docs.microsoft.com",
@@ -68,21 +71,24 @@ DOMAINS_POOL = [
     "www.bing.com", "support.microsoft.com", "www.office.com", "admin.microsoft.com",
     "www.xbox.com", "www.skype.com", "www.linkedin.com", "engineering.linkedin.com",
     "github.com", "docs.github.com", "gist.github.com", "raw.githubusercontent.com",
+    "nuget.org", "dotnet.microsoft.com", "news.microsoft.com", "surface.com",
 
     # ---------- 5. 谷歌 Google & GCP (AS15169 / AS396982) ----------
     "cloud.google.com", "developers.google.com", "dns.google", "workspace.google.com",
     "dl.google.com", "fonts.googleapis.com", "firebase.google.com", "admin.google.com",
     "domains.google.com", "www.google.com", "maps.google.com", "drive.google.com",
     "mail.google.com", "play.google.com", "news.google.com", "scholar.google.com",
-    "cloud.google.com", "translate.google.com", "opensource.google", "flutter.dev",
-    "golang.org", "dart.dev", "tensorflow.org", "web.dev", "chromium.org",
+    "translate.google.com", "opensource.google", "flutter.dev", "golang.org",
+    "dart.dev", "tensorflow.org", "web.dev", "chromium.org", "android.com",
+    "developer.android.com", "source.android.com", "cloudsearch.google.com", "trends.google.com",
 
-    # ---------- 6. Cloudflare & 常见网络基建 (AS13335 / AS209242) ----------
+    # ---------- 6. Cloudflare & 全球 CDN/网络基建 (AS13335 / AS209242) ----------
     "www.cloudflare.com", "dash.cloudflare.com", "developers.cloudflare.com",
     "community.cloudflare.com", "workers.dev", "pages.dev", "one.one.one.one",
     "cloudflare-dns.com", "warp.plus", "radar.cloudflare.com", "blog.cloudflare.com",
+    "www.fastly.com", "docs.fastly.com", "bunny.net", "www.gcore.com", "www.keycdn.com",
 
-    # ---------- 7. 甲骨文、IBM、SAP、思科与大型企业 IT (50+) ----------
+    # ---------- 7. 甲骨文、IBM、SAP、思科等企业 IT 巨头 (50+) ----------
     "www.oracle.com", "cloud.oracle.com", "docs.oracle.com", "blogs.oracle.com",
     "developer.oracle.com", "support.oracle.com", "academy.oracle.com", "www.java.com",
     "www.ibm.com", "cloud.ibm.com", "www.redhat.com", "access.redhat.com",
@@ -92,17 +98,18 @@ DOMAINS_POOL = [
     "www.vmware.com", "blogs.vmware.com", "www.broadcom.com", "www.splunk.com",
     "www.salesforce.com", "developer.salesforce.com", "www.service-now.com",
     "www.workday.com", "www.atlassian.com", "confluence.atlassian.com", "jira.atlassian.com",
+    "www.adobe.com", "helpx.adobe.com", "creativecloud.adobe.com", "www.autodesk.com",
+    "www.ansys.com", "www.mathworks.com", "www.synopsys.com", "www.cadence.com",
 
-    # ---------- 8. 欧洲与全球知名云与服务器商 (Hetzner/OVH/DO/Vultr/Linode) ----------
+    # ---------- 8. 欧洲与全球知名云服务器商 (Hetzner/OVH/DO/Vultr/Linode) ----------
     "www.hetzner.com", "robot.hetzner.com", "accounts.hetzner.com", "docs.hetzner.com",
     "community.hetzner.com", "status.hetzner.com", "konsoleh.hetzner.com",
     "www.ovhcloud.com", "www.ovh.com", "docs.ovh.com", "help.ovhcloud.com",
     "api.ovh.com", "community.ovh.com", "www.digitalocean.com", "cloud.digitalocean.com",
     "docs.digitalocean.com", "community.digitalocean.com", "www.vultr.com", "my.vultr.com",
     "docs.vultr.com", "www.linode.com", "cloud.linode.com", "www.akamai.com",
-    "www.fastly.com", "docs.fastly.com", "bunny.net", "www.gcore.com",
 
-    # ---------- 9. 全球知名顶尖高校与科研学术机构 (120+) ----------
+    # ---------- 9. 全球知名顶尖高校与科研学术机构 (150+) ----------
     "www.harvard.edu", "www.mit.edu", "www.stanford.edu", "www.berkeley.edu",
     "www.yale.edu", "www.princeton.edu", "www.columbia.edu", "www.caltech.edu",
     "www.uchicago.edu", "www.jhu.edu", "www.northwestern.edu", "www.cornell.edu",
@@ -115,24 +122,27 @@ DOMAINS_POOL = [
     "www.bu.edu", "www.tufts.edu", "www.bc.edu", "www.brandeis.edu", "www.georgetown.edu",
     "www.rochester.edu", "www.case.edu", "www.tulane.edu", "www.rutgers.edu",
     "www.pitt.edu", "www.colorado.edu", "www.arizona.edu", "www.asu.edu",
-    "www.tamu.edu", "www.fsu.edu", "www.ufl.edu", "www.miami.edu",
+    "www.tamu.edu", "www.fsu.edu", "www.ufl.edu", "www.miami.edu", "www.ucf.edu",
     "www.cam.ac.uk", "www.ox.ac.uk", "www.ucl.ac.uk", "www.ed.ac.uk",
     "www.manchester.ac.uk", "www.kcl.ac.uk", "www.bris.ac.uk", "www.warwick.ac.uk",
     "www.gla.ac.uk", "www.sheffield.ac.uk", "www.bham.ac.uk", "www.leeds.ac.uk",
     "www.soton.ac.uk", "www.dur.ac.uk", "www.nottingham.ac.uk", "www.st-andrews.ac.uk",
+    "www.bath.ac.uk", "www.york.ac.uk", "www.exeter.ac.uk", "www.lancs.ac.uk",
     "www.ethz.ch", "www.epfl.ch", "www.tum.de", "www.uni-heidelberg.de",
     "www.lmu.de", "www.fu-berlin.de", "www.hu-berlin.de", "www.rwth-aachen.de",
-    "www.uni-bonn.de", "www.uni-tuebingen.de", "www.uni-freiburg.de",
+    "www.uni-bonn.de", "www.uni-tuebingen.de", "www.uni-freiburg.de", "www.kit.edu",
     "www.utoronto.ca", "www.ubc.ca", "www.mcgill.ca", "www.uwaterloo.ca",
-    "www.ualberta.ca", "www.umontreal.ca", "www.mcmaster.ca",
+    "www.ualberta.ca", "www.umontreal.ca", "www.mcmaster.ca", "www.uottawa.ca",
     "www.anu.edu.au", "www.unimelb.edu.au", "www.sydney.edu.au", "www.uq.edu.au",
     "www.unsw.edu.au", "www.monash.edu.au", "www.adelaide.edu.au", "www.uwa.edu.au",
     "www.u-tokyo.ac.jp", "www.kyoto-u.ac.jp", "www.titech.ac.jp", "www.osaka-u.ac.jp",
     "www.tohoku.ac.jp", "www.nagoya-u.ac.jp", "www.kyushu-u.ac.jp", "www.hokkaido-u.ac.jp",
-    "www.nus.edu.sg", "www.ntu.edu.sg", "www.smu.edu.sg", "www.hku.hk",
-    "www.cuhk.edu.hk", "www.hkust.edu.hk", "www.polyu.edu.hk", "www.cityu.edu.hk",
+    "www.waseda.jp", "www.keio.ac.jp", "www.tsukuba.ac.jp", "www.kobe-u.ac.jp",
+    "www.nus.edu.sg", "www.ntu.edu.sg", "www.smu.edu.sg", "www.sutd.edu.sg",
+    "www.hku.hk", "www.cuhk.edu.hk", "www.hkust.edu.hk", "www.polyu.edu.hk",
+    "www.cityu.edu.hk", "www.snu.ac.kr", "www.kaist.ac.kr", "www.postech.ac.kr",
 
-    # ---------- 10. 国际民航、航运物流与全球供应链 (60+) ----------
+    # ---------- 10. 国际民航、航运物流与全球供应链 (70+) ----------
     "www.ana.co.jp", "www.jal.co.jp", "www.singaporeair.com", "www.lufthansa.com",
     "www.airfrance.com", "www.klm.com", "www.britishairways.com", "www.cathaypacific.com",
     "www.emirates.com", "www.qatarairways.com", "www.delta.com", "www.united.com",
@@ -144,8 +154,9 @@ DOMAINS_POOL = [
     "www.maersk.com", "www.msc.com", "www.cma-cgm.com", "www.hapag-lloyd.com",
     "www.one-line.com", "www.evergreen-marine.com", "www.yangming.com", "www.coscoshipping.com",
     "www.kuehne-nagel.com", "www.dbschenker.com", "www.expeditors.com", "www.chrobinson.com",
+    "www.nipponexpress.com", "www.bollore-logistics.com", "www.geodis.com", "www.tollgroup.com",
 
-    # ---------- 11. 国际商旅酒店与度假集团 (40+) ----------
+    # ---------- 11. 国际商旅酒店与度假平台 (50+) ----------
     "www.marriott.com", "www.hilton.com", "www.hyatt.com", "www.ihg.com",
     "www.wyndhamhotels.com", "www.accor.com", "www.radissonhotels.com",
     "www.bestwestern.com", "www.fourseasons.com", "www.mandarinoriental.com",
@@ -153,8 +164,9 @@ DOMAINS_POOL = [
     "www.langhamhotels.com", "www.panpacific.com", "www.sixsenses.com", "www.banyan-tree.com",
     "www.booking.com", "www.agoda.com", "www.tripadvisor.com", "www.expedia.com",
     "www.hotels.com", "www.kayak.com", "www.skyscanner.com", "www.trivago.com",
+    "www.airbnb.com", "www.vrbo.com", "www.hostelworld.com", "www.priceline.com",
 
-    # ---------- 12. 芯片半导体、通信电子与仪器测试 (70+) ----------
+    # ---------- 12. 芯片半导体、通信电子与仪器测试 (80+) ----------
     "www.intel.com", "www.amd.com", "www.nvidia.com", "www.qualcomm.com",
     "www.arm.com", "www.ti.com", "www.st.com", "www.nxp.com", "www.infineon.com",
     "www.analog.com", "www.microchip.com", "www.broadcom.com", "www.marvell.com",
@@ -165,8 +177,9 @@ DOMAINS_POOL = [
     "www.anritsu.com", "www.yokogawa.com", "www.omron.com", "www.fanuc.com",
     "www.keyence.com", "www.mitsubishielectric.com", "www.schneider-electric.com",
     "www.abb.com", "www.siemens.com", "www.bosch.com", "www.eaton.com",
+    "www.rockwellautomation.com", "www.honeywell.com", "www.emerson.com", "www.danfoss.com",
 
-    # ---------- 13. 汽车工业与高端机械制造 (60+) ----------
+    # ---------- 13. 汽车工业与重型工业制造 (70+) ----------
     "www.bmw.com", "www.mercedes-benz.com", "www.audi.com", "www.volkswagen.com",
     "www.porsche.com", "www.toyota.com", "www.honda.com", "www.nissan-global.com",
     "www.volvocars.com", "www.ford.com", "www.gm.com", "www.hyundai.com",
@@ -175,8 +188,9 @@ DOMAINS_POOL = [
     "www.rolls-roycemotorcars.com", "www.mclaren.com", "www.jaguar.com", "www.landrover.com",
     "www.tesla.com", "www.lucidmotors.com", "www.rivian.com", "www.polestar.com",
     "www.cat.com", "www.komatsu.com", "www.deere.com", "www.cummins.com",
+    "www.hitachicm.com", "www.liebherr.com", "www.sandvik.coromant.com", "www.atlascopco.com",
 
-    # ---------- 14. 消费电子、相机、乐器与运动品牌 (70+) ----------
+    # ---------- 14. 消费电子、相机、乐器与运动品牌 (80+) ----------
     "www.apple.com", "developer.apple.com", "support.apple.com", "www.sony.com",
     "www.panasonic.com", "www.samsung.com", "www.lg.com", "www.nikon.com",
     "www.canon.com", "www.fujifilm.com", "www.leica-camera.com", "www.zeiss.com",
@@ -189,8 +203,9 @@ DOMAINS_POOL = [
     "www.salomon.com", "www.arcteryx.com", "www.patagonia.com", "www.thenorthface.com",
     "www.columbia.com", "www.mammut.com", "www.shimano.com", "www.giant-bicycles.com",
     "www.trekbikes.com", "www.specialized.com", "www.decathlon.com", "www.uniqlo.com",
+    "www.zara.com", "www.hm.com", "www.lululemon.com", "www.speedo.com",
 
-    # ---------- 15. 世界著名博物馆、图书馆与文化组织 (40+) ----------
+    # ---------- 15. 世界著名博物馆、图书馆与文化组织 (45+) ----------
     "www.louvre.fr", "www.metmuseum.org", "www.moma.org", "www.si.edu",
     "www.bl.uk", "www.nationalgallery.org.uk", "www.tate.org.uk", "www.uffizi.it",
     "www.musee-orsay.fr", "www.rijksmuseum.nl", "www.van-gogh-museum.nl",
@@ -200,8 +215,9 @@ DOMAINS_POOL = [
     "www.fitzmuseum.cam.ac.uk", "www.ashmolean.org", "www.centrepompidou.fr",
     "www.un.org", "www.who.int", "www.w3.org", "www.ietf.org", "www.icann.org",
     "www.unesco.org", "www.worldbank.org", "www.imf.org", "www.oecd.org",
+    "www.weforum.org", "www.cern.ch", "www.eso.org", "www.esa.int",
 
-    # ---------- 16. 开源基金会、Linux 镜像与开发者生态 (80+) ----------
+    # ---------- 16. 开源基金会、Linux 镜像与开发者生态 (90+) ----------
     "www.debian.org", "www.ubuntu.com", "www.kernel.org", "www.archlinux.org",
     "www.freebsd.org", "www.opensuse.org", "www.alpinelinux.org", "www.centos.org",
     "www.fedora.org", "rockylinux.org", "almalinux.org", "www.gentoo.org",
@@ -215,8 +231,10 @@ DOMAINS_POOL = [
     "www.keepass.info", "grafana.com", "www.zabbix.com", "www.prometheus.io",
     "cdnjs.cloudflare.com", "cdn.jsdelivr.net", "unpkg.com", "www.eff.org",
     "archive.org", "www.wikipedia.org", "www.wikimedia.org", "wikimediafoundation.org",
+    "kubernetes.io", "helm.sh", "istio.io", "envoyproxy.io", "traefik.io",
+    "www.elastic.co", "www.consul.io", "www.terraform.io", "www.vaultproject.io",
 
-    # ---------- 17. 全球知名金融、银行、保险与在线支付 (50+) ----------
+    # ---------- 17. 全球知名金融、银行、保险与在线支付 (70+) ----------
     "www.jpmorgan.com", "www.jpmorganchase.com", "www.chase.com", "www.bankofamerica.com",
     "www.citigroup.com", "www.citi.com", "www.wellsfargo.com", "www.goldmansachs.com",
     "www.morganstanley.com", "www.hsbc.com", "www.standardchartered.com", "www.barclays.com",
@@ -225,15 +243,17 @@ DOMAINS_POOL = [
     "www.mufg.jp", "www.smfg.co.jp", "www.mizuho-fg.co.jp", "www.dbs.com",
     "www.ocbc.com", "www.uobgroup.com", "www.visa.com", "usa.visa.com",
     "www.mastercard.com", "www.americanexpress.com", "www.paypal.com", "www.stripe.com",
-    "www.squareup.com", "www.adアーティスト.com", "www.bloomberg.com", "www.reuters.com",
+    "www.squareup.com", "www.bloomberg.com", "www.reuters.com", "www.nasdaq.com",
+    "www.nyse.com", "www.ft.com", "www.wsj.com", "www.cnbc.com", "www.forbes.com",
 
-    # ---------- 18. 权威学术出版与科学期刊 (40+) ----------
+    # ---------- 18. 权威学术出版与科学期刊 (50+) ----------
     "www.nature.com", "www.sciencedirect.com", "www.springer.com", "ieeexplore.ieee.org",
     "www.sciencemag.org", "www.cell.com", "www.thelancet.com", "www.nejm.org",
     "www.pnas.org", "www.jamanetwork.com", "www.wiley.com", "onlinelibrary.wiley.com",
     "academic.oup.com", "www.cambridge.org", "www.taylorfrancis.com", "www.sagepub.com",
     "arxiv.org", "biorxiv.org", "medrxiv.org", "pubmed.ncbi.nlm.nih.gov",
-    "www.frontiersin.org", "www.mdpi.com", "journals.plos.org", "www.annualreviews.org"
+    "www.frontiersin.org", "www.mdpi.com", "journals.plos.org", "www.annualreviews.org",
+    "royalsocietypublishing.org", "aip.scitation.org", "journals.aps.org", "pubs.acs.org"
 ]
 
 
@@ -293,7 +313,6 @@ def bulk_lookup_ip_asn(ip_list):
     if not valid_ips:
         return ip_asn_map
 
-    # 分批查询 (每批 200 个 IP，保证通信极其稳健)
     batch_size = 200
     for i in range(0, len(valid_ips), batch_size):
         chunk = valid_ips[i:i + batch_size]
@@ -302,7 +321,6 @@ def bulk_lookup_ip_asn(ip_list):
             s.settimeout(6.0)
             s.connect(('whois.cymru.com', 43))
             
-            # 构造 Cymru Bulk 查询报文
             query = "begin\nverbose\n" + "\n".join(chunk) + "\nend\n"
             s.send(query.encode())
             
@@ -314,7 +332,6 @@ def bulk_lookup_ip_asn(ip_list):
                 resp += data
             s.close()
 
-            # 解析返回表格: AS | IP | BGP Prefix | CC | Registry | ...
             for line in resp.decode(errors='ignore').splitlines():
                 line = line.strip()
                 if line and not line.startswith("AS") and not line.startswith("Bulk"):
